@@ -1,12 +1,17 @@
 import { ChatGptWebAdapterError } from "./adapter-error";
 
-/** Maximum number of automatic browser-turn retries after the initial send. */
-export const MAX_CHATGPT_WEB_TURN_RETRIES = 3;
+/** Safe default: a failed ChatGPT browser send never causes an automatic second message. */
+export const DEFAULT_CHATGPT_WEB_TURN_RETRIES = 0;
+/** Backward-compatible exported budget name; now reflects the safe default. */
+export const MAX_CHATGPT_WEB_TURN_RETRIES = DEFAULT_CHATGPT_WEB_TURN_RETRIES;
+/** Configuration guardrail; this is not a recommendation to retry browser sends. */
+export const MAX_CONFIGURED_CHATGPT_WEB_TURN_RETRIES = 10;
 const RETRY_BUDGET_TTL_MS = 30 * 60_000;
 
 interface RetryBudgetEntry {
   retries: number;
   updatedAt: number;
+  nextAttemptAt: number;
   lastError: {
     message: string;
     status: number;
@@ -15,9 +20,9 @@ interface RetryBudgetEntry {
   };
 }
 
-function exhaustedError(entry: RetryBudgetEntry): ChatGptWebAdapterError {
+function exhaustedError(entry: RetryBudgetEntry, allowedRetries: number): ChatGptWebAdapterError {
   return new ChatGptWebAdapterError(
-    `${entry.lastError.message} Automatic browser-turn retry limit reached after ${MAX_CHATGPT_WEB_TURN_RETRIES} retries; refusing to send another message.`,
+    `${entry.lastError.message} Automatic browser-turn retry budget is ${allowedRetries}; refusing to send another message.`,
     {
       status: entry.lastError.status,
       errorType: entry.lastError.errorType,
@@ -36,12 +41,23 @@ export class ChatGptWebTurnRetryPolicy {
 
   constructor(private readonly ttlMs = RETRY_BUDGET_TTL_MS) {}
 
-  recordRetryableFailure(key: string, error: ChatGptWebAdapterError, now = Date.now()): ChatGptWebAdapterError {
+  recordRetryableFailure(
+    key: string,
+    error: ChatGptWebAdapterError,
+    allowedRetries = DEFAULT_CHATGPT_WEB_TURN_RETRIES,
+    backoffBaseMs = 2_000,
+    now = Date.now(),
+  ): ChatGptWebAdapterError {
+    this.assertAllowedRetries(allowedRetries);
+    if (!Number.isInteger(backoffBaseMs) || backoffBaseMs < 0 || backoffBaseMs > 60_000) {
+      throw new Error("ChatGPT browser retry backoff must be an integer from 0 to 60000 milliseconds");
+    }
     this.prune(now);
     const previous = this.entries.get(key);
     const entry: RetryBudgetEntry = {
       retries: (previous?.retries ?? 0) + 1,
       updatedAt: now,
+      nextAttemptAt: now + Math.min(60_000, backoffBaseMs * 2 ** (previous?.retries ?? 0)),
       lastError: {
         message: error.message,
         status: error.status,
@@ -50,13 +66,30 @@ export class ChatGptWebTurnRetryPolicy {
       },
     };
     this.entries.set(key, entry);
-    return entry.retries > MAX_CHATGPT_WEB_TURN_RETRIES ? exhaustedError(entry) : error;
+    return entry.retries > allowedRetries ? exhaustedError(entry, allowedRetries) : error;
   }
 
-  exhaustedError(key: string, now = Date.now()): ChatGptWebAdapterError | undefined {
+  retryDelayMs(
+    key: string,
+    allowedRetries = DEFAULT_CHATGPT_WEB_TURN_RETRIES,
+    now = Date.now(),
+  ): number {
+    this.assertAllowedRetries(allowedRetries);
     this.prune(now);
     const entry = this.entries.get(key);
-    return entry && entry.retries > MAX_CHATGPT_WEB_TURN_RETRIES ? exhaustedError(entry) : undefined;
+    if (!entry || entry.retries > allowedRetries) return 0;
+    return Math.max(0, entry.nextAttemptAt - now);
+  }
+
+  exhaustedError(
+    key: string,
+    allowedRetries = DEFAULT_CHATGPT_WEB_TURN_RETRIES,
+    now = Date.now(),
+  ): ChatGptWebAdapterError | undefined {
+    this.assertAllowedRetries(allowedRetries);
+    this.prune(now);
+    const entry = this.entries.get(key);
+    return entry && entry.retries > allowedRetries ? exhaustedError(entry, allowedRetries) : undefined;
   }
 
   clear(key: string): void {
@@ -66,6 +99,14 @@ export class ChatGptWebTurnRetryPolicy {
   private prune(now: number): void {
     for (const [key, entry] of this.entries) {
       if (now - entry.updatedAt >= this.ttlMs) this.entries.delete(key);
+    }
+  }
+
+  private assertAllowedRetries(value: number): void {
+    if (!Number.isInteger(value) || value < 0 || value > MAX_CONFIGURED_CHATGPT_WEB_TURN_RETRIES) {
+      throw new Error(
+        `ChatGPT browser turn retries must be an integer from 0 to ${MAX_CONFIGURED_CHATGPT_WEB_TURN_RETRIES}`,
+      );
     }
   }
 }

@@ -20,9 +20,9 @@
 
 Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
 expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra High**, and **Pro** as
-their subscription allows. The bridge sends the current compiled Codex task context to a fresh
-ChatGPT Temporary Chat, attaches images, and streams visible reasoning, tool activity, and Markdown
-back into the same Codex task.
+their subscription allows. ChatGPT Web Continuum binds each Codex task to one Temporary Chat: the
+first turn sends the required compiled context, later turns send only the locally proven delta.
+Images, visible reasoning, tool activity, and Markdown still stream back into the same Codex task.
 
 <p align="center">
   <img src="assets/demo.gif" alt="A live ChatGPT Web turn using the native Codex harness" width="960">
@@ -35,8 +35,8 @@ Codex task ──Responses + SSE──▶ codex-chatgpt-web ──embedded brows
 ```
 
 Codex keeps the native task, context lifecycle, UI, and tool harness. The local Responses bridge
-routes only the selected model turn through a fresh ChatGPT Temporary Chat; in full mode, MCP
-connects ChatGPT back to the tools of that same Codex task.
+routes the selected model through a task-bound ChatGPT Temporary Chat; in full mode, MCP connects
+ChatGPT back to the tools of that same Codex task.
 
 ## Highlights
 
@@ -49,10 +49,11 @@ connects ChatGPT back to the tools of that same Codex task.
   another host model. The original model picker, task lifecycle, streaming, tracing, and tool UI
   remain intact.
 - **Local-first task sessions.** Codex remains the source of truth for task history on your
-  computer. Every browser turn starts in a fresh ChatGPT Temporary Chat and receives the current
-  compiled context. Measured browser ceilings trigger compaction, while Luna carries completed
-  state through an adaptive rolling checkpoint. Browser chats are never reused across tasks or
-  added to normal ChatGPT history.
+  computer. Continuum retains one Temporary Chat per task, verifies both the local acknowledged
+  prefix and the browser transcript digest, then sends only the ordered delta. Resume, fork,
+  compaction, restart, eviction, or a digest mismatch causes a controlled full-context reset.
+  Luna continues to use its adaptive rolling checkpoint. Browser chats are never reused across
+  tasks or added to normal ChatGPT history.
 - **The full Codex harness over MCP.** In full mode, Instant through Extra High can use the active
   Codex task's filesystem, shell, images, approvals, and configured tools/apps through MCP. Calls
   and real results stay inside the same browser response—nothing is simulated as text.
@@ -159,6 +160,12 @@ them. See
 Unexpected approval prompts fail closed unless `--auto-approve-tool-calls` is explicitly enabled;
 that option clicks **Allow once**, never a permanent grant.
 
+Continuum is enabled by default. Advanced terminal setup can restore the legacy fresh-chat
+transport with `--context-mode stateless`. Automatic browser re-sends default to zero. They can be
+enabled explicitly with `--browser-turn-retries N`; non-rate-limit retries use exponential backoff
+starting at `--browser-retry-backoff-ms N` (default 2000 ms). ChatGPT rate limits are always
+terminal for the current browser attempt and never trigger another automatic message.
+
 ## Operations
 
 Use **Activity** for structured local logs and **Settings → Run doctor** for end-to-end health
@@ -180,6 +187,9 @@ capture a screenshot at every checkpoint during an investigation.
   [#76](https://github.com/miuuyy/codex-chatgpt-web/issues/76).
 - Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
   running as the same local user. Never share the launcher profile; use a trusted workstation.
+- The local Continuum ledger stores only bounded semantic digests and opaque task keys, not prompt
+  text, answers, cookies, capability tokens, or browser profile data. A missing or mismatched
+  digest selects a complete reset; it never silently truncates or acknowledges context.
 - Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. The browser
   flow is manually exercised end-to-end on macOS and Windows 11; runtime, tests, and native
   packaging are gated on all three operating systems in CI.

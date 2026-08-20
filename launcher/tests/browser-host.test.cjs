@@ -670,7 +670,7 @@ test("a live helper retains exclusive ownership of its running turn", () => {
       manualOperation: null,
       turnTabs: new Map([[tab.id, tab]]),
     }, tab.traceId, false, process.pid + 1),
-    /owned by another helper process/,
+    /task surface is already running turn/,
   );
 });
 
@@ -1090,16 +1090,75 @@ test("a later provider round reuses its task tab and restores active ownership",
   assert.deepEqual(events, ["visible", "published", "descriptor", "browser.tab_reused"]);
 });
 
-test("five browser tabs are a hard account-safety limit", () => {
+test("five active browser tabs are a hard account-safety limit", () => {
   const turnTabs = new Map(Array.from({ length: 5 }, (_unused, index) => [
     `tab-${index + 1}`,
-    { ordinal: index + 1 },
+    { ordinal: index + 1, status: "running" },
   ]));
 
   assert.throws(
     () => BrowserHost.prototype.createTurnTab.call({ turnTabs }, "trace_six", 444),
-    /already has 5 browser tabs.*avoid excessive parallel traffic/,
+    /already has 5 active browser tabs.*avoid excessive parallel traffic/,
   );
+});
+
+test("a completed Continuum task retains and re-leases its exact browser surface", async () => {
+  const taskKey = "a".repeat(64);
+  const throttling = [];
+  const tab = {
+    id: "tab-continuum",
+    surfaceId: "surface-continuum",
+    taskKey,
+    traceId: "trace_first",
+    helperPid: 801,
+    status: "running",
+    loading: true,
+    view: { webContents: {
+      isDestroyed: () => false,
+      setBackgroundThrottling: (enabled) => throttling.push(enabled),
+    } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    manualOperation: null,
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    selectedTabId: tab.id,
+    syncViewVisibility() {},
+    writeDescriptor() {},
+    publishState() {},
+    snapshot: () => ({ tabs: [] }),
+    hide() {},
+    logger: { info() {}, warn() {} },
+  });
+
+  await BrowserHost.prototype.endTurn.call(
+    fixture,
+    tab.traceId,
+    tab.helperPid,
+    "completed",
+    true,
+  );
+
+  expectRetained();
+  function expectRetained() {
+    assert.equal(fixture.turnTabs.get(tab.id), tab);
+    assert.equal(tab.status, "ready");
+  }
+  const lease = BrowserHost.prototype.beginTurn.call(
+    fixture,
+    "trace_second",
+    false,
+    process.pid,
+    taskKey,
+  );
+  assert.deepEqual(lease, {
+    surfaceId: tab.surfaceId,
+    tabId: tab.id,
+    resumed: true,
+  });
+  assert.equal(tab.traceId, "trace_second");
+  assert.equal(tab.status, "running");
+  assert.deepEqual(throttling, [true, false]);
 });
 
 test("ending one browser turn does not stop another running tab", async () => {

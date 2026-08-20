@@ -8,6 +8,7 @@ import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
 export type BrowserHostMode = "managed-chrome" | "launcher";
+export type ChatGptContextMode = "stateful" | "stateless";
 
 /**
  * ChatGPT caches a connector's public MCP contract by connector identity. The direct turn-token
@@ -67,6 +68,9 @@ export interface AppConfig {
   solAvailable: boolean;
   proAvailable: boolean;
   autoApproveToolCalls: boolean;
+  contextMode?: ChatGptContextMode;
+  browserTurnRetries?: number;
+  browserRetryBackoffMs?: number;
   controlToken: string;
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
@@ -158,6 +162,9 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     solAvailable: true,
     proAvailable: false,
     autoApproveToolCalls: false,
+    contextMode: "stateful",
+    browserTurnRetries: 0,
+    browserRetryBackoffMs: 2_000,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
   };
@@ -318,6 +325,20 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (typeof parsed.autoApproveToolCalls !== "boolean") {
     throw new Error(`Invalid autoApproveToolCalls in ${path}`);
   }
+  const contextMode = parsed.contextMode ?? "stateful";
+  if (contextMode !== "stateful" && contextMode !== "stateless") {
+    throw new Error(`Invalid contextMode in ${path}`);
+  }
+  const browserTurnRetries = parsed.browserTurnRetries ?? 0;
+  if (!Number.isInteger(browserTurnRetries) || browserTurnRetries < 0 || browserTurnRetries > 10) {
+    throw new Error(`Invalid browserTurnRetries in ${path}; expected an integer from 0 to 10`);
+  }
+  const browserRetryBackoffMs = parsed.browserRetryBackoffMs ?? 2_000;
+  if (!Number.isInteger(browserRetryBackoffMs)
+    || browserRetryBackoffMs < 250
+    || browserRetryBackoffMs > 60_000) {
+    throw new Error(`Invalid browserRetryBackoffMs in ${path}; expected an integer from 250 to 60000`);
+  }
   const requiredStrings: Array<keyof AppConfig> = [
     "appName", "chromeExecutablePath", "storageStatePath", "brokerSocketPath", "controlToken",
   ];
@@ -379,7 +400,14 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (proAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Sol`);
   }
-  return { ...parsed, solAvailable, proAvailable } as AppConfig;
+  return {
+    ...parsed,
+    solAvailable,
+    proAvailable,
+    contextMode,
+    browserTurnRetries,
+    browserRetryBackoffMs,
+  } as AppConfig;
 }
 
 export function saveConfig(config: AppConfig): void {
@@ -412,6 +440,10 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       brokerSocketPath: config.brokerSocketPath,
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
       lunaCheckpointStatePath: join(getConfigDir(), "runtime", "luna-checkpoints.json"),
+      continuumStatePath: join(getConfigDir(), "runtime", "continuum-state.json"),
+      contextMode: config.contextMode ?? "stateful",
+      browserTurnRetries: config.browserTurnRetries ?? 0,
+      browserRetryBackoffMs: config.browserRetryBackoffMs ?? 2_000,
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
       solAvailable: config.solAvailable,

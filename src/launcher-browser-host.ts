@@ -271,7 +271,7 @@ export const LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS = 30_000;
 export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
 export type LauncherTurnActivity =
-  | { phase: "start"; traceId: string; helperPid: number }
+  | { phase: "start"; traceId: string; helperPid: number; taskKey?: string }
   | { phase: "heartbeat"; traceId: string; helperPid: number }
   | {
       phase: "end";
@@ -294,7 +294,7 @@ export async function notifyLauncherTurn(
     : activity.phase === "heartbeat"
       ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
       : LAUNCHER_TURN_START_TIMEOUT_MS,
-): Promise<{ surfaceId?: string }> {
+): Promise<{ surfaceId?: string; resumed?: boolean }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -317,7 +317,13 @@ export async function notifyLauncherTurn(
       if (typeof body.surfaceId !== "string" || !/^[A-Za-z0-9_-]{32}$/.test(body.surfaceId)) {
         throw new Error("Launcher browser control channel returned an invalid turn surface id");
       }
-      return { surfaceId: body.surfaceId };
+      if (body.resumed !== undefined && typeof body.resumed !== "boolean") {
+        throw new Error("Launcher browser control channel returned an invalid resume flag");
+      }
+      return {
+        surfaceId: body.surfaceId,
+        ...(typeof body.resumed === "boolean" ? { resumed: body.resumed } : {}),
+      };
     }
     return {};
   } catch (error) {

@@ -23,7 +23,8 @@ launcher-owned codex-chatgpt-web daemon
 - Exposes Instant (`chatgpt-web/light`), Medium, High, and Extra High; each model advertises exactly one
   immutable Codex effort matching its ChatGPT browser mode. `chatgpt-web/pro` is appended only when
   the authenticated account exposes Pro.
-- Sends the complete Codex context and image attachments to a fresh ChatGPT Temporary Chat.
+- Uses Continuum task binding for Sol models: a complete first turn followed by proven deltas.
+  Luna keeps its separate rolling-checkpoint transport.
 - Never starts the broker, tunnel, or MCP server.
 - Emits a nonfatal Codex commentary warning that local tools are unavailable for the selected model.
 
@@ -46,13 +47,13 @@ the legacy connector. Future public schema changes require another explicit conn
 ## Browser lifecycle
 
 The desktop launcher owns one persistent Electron partition and up to five task-bound browser
-tabs. Each Codex task is leased an independent `WebContentsView` and surface ID; Playwright attaches
-to that exact surface through a launcher-owned loopback CDP endpoint. Model turns never launch a
-second browser or copy state between turn tabs. Each tab opens a fresh Temporary Chat, shares only
-the local login partition, and keeps its own document and lifecycle. Completed tabs remain
-inspectable until closed. Closing a running tab destroys its page and terminates that browser turn.
-A sixth concurrent turn fails explicitly; the cap avoids excessive parallel traffic that could
-trigger account abuse controls.
+tabs. Each Codex task is leased an independent `WebContentsView`, opaque task key, and surface ID;
+Playwright attaches to that exact surface through a launcher-owned loopback CDP endpoint. Model
+turns never launch a second browser or copy state between task tabs. A successfully completed tab
+remains bound to its task and is re-leased for the next turn. Failed, aborted, manually closed, or
+unproven surfaces are destroyed. When five idle task surfaces exist, a new task evicts the least
+recently used one; a sixth concurrent active turn fails explicitly. The cap avoids excessive
+parallel account traffic that could trigger account abuse controls.
 
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
@@ -61,10 +62,20 @@ server-authenticated session and the Temporary Chat composer in the primary owne
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
-The current compiled Codex task context is inserted as one inline JSON envelope. Image bytes stay
-out of the JSON and are attached natively with stable references. The runtime does not create a
-context JSONL file, upload a synthetic context document, include prompt hashes, or silently truncate
-the envelope. Attachment acceptance and send readiness are verified before the turn begins.
+Continuum keeps a bounded digest-only ledger keyed by the native Codex `thread_id`. The first turn
+inserts the required compiled task context as one inline JSON envelope. After a completed browser
+answer, the runtime records hashes of the semantic input prefix and final answer. A later Codex
+turn may use a delta only when its history has that exact prefix and proven answer, and when the
+retained browser tab exposes the exact prior prompt marker. New images are attached only with the
+delta; the full reset fallback retains every currently relevant attachment.
+
+Forks receive a new task key. Resume can continue after a daemon restart when the digest ledger and
+browser surface both survive. Compaction replacement, launcher restart, LRU eviction, missing
+output, or any local/browser digest mismatch selects a fresh Temporary Chat with the complete
+current context. If that full reset exceeds the measured transport ceiling, the request fails and
+requires Codex compaction; it is never truncated silently. The runtime does not create a context
+JSONL file or upload a synthetic context document. Attachment acceptance, exact composer readback,
+submission evidence, and completed-turn evidence remain mandatory before acknowledgement.
 
 The appended models advertise the authenticated account's context window and a ten-percent
 auto-compaction reserve. Usage is counted with the GPT-5 tokenizer plus fixed platform/image
@@ -134,6 +145,8 @@ launcher error.
 - Never place secret values in command-line arguments, logs, generated profiles, or Git.
 - Limit browser turns to five independent task-bound tabs and reject unsupported models explicitly.
   The selected routed model fixes the adapter effort; a conflicting request effort cannot change it.
+- Default automatic browser retries to zero. Explicit non-rate-limit retries have a bounded count
+  and exponential backoff; a ChatGPT rate limit never sends another automatic message.
 - Do not retry or switch modes to evade product usage limits.
 
 See the complete [security model](security-model.md).

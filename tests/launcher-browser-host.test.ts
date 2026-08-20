@@ -62,13 +62,18 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     received = {
       authorization: request.headers.authorization,
-      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      body,
     };
     response.writeHead(200, { "content-type": "application/json" });
     response.end(request.url === "/v1/turn/start"
-      ? '{"ok":true,"surfaceId":"launcher_surface_id_0123456789AB"}\n'
+      ? JSON.stringify({
+        ok: true,
+        surfaceId: "launcher_surface_id_0123456789AB",
+        ...(body.taskKey ? { resumed: true } : {}),
+      })
       : '{"ok":true}\n');
   });
   await new Promise<void>((resolve, reject) => {
@@ -86,6 +91,19 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     })).resolves.toEqual({ surfaceId: "launcher_surface_id_0123456789AB" });
     expect(received.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
     expect(received.body).toEqual({ phase: "start", traceId: "abc123def456", helperPid: process.pid });
+    const taskKey = "d".repeat(64);
+    await expect(notifyLauncherTurn(path, {
+      phase: "start",
+      traceId: "continuum123",
+      helperPid: process.pid,
+      taskKey,
+    })).resolves.toEqual({ surfaceId: "launcher_surface_id_0123456789AB", resumed: true });
+    expect(received.body).toEqual({
+      phase: "start",
+      traceId: "continuum123",
+      helperPid: process.pid,
+      taskKey,
+    });
     await notifyLauncherTurn(path, {
       phase: "heartbeat",
       traceId: "abc123def456",

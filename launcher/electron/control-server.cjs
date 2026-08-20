@@ -113,9 +113,19 @@ class BrowserControlServer {
       if (!Number.isInteger(body.helperPid) || body.helperPid < 1) {
         throw new Error("browser helper pid is invalid");
       }
+      if (body.taskKey !== undefined && !/^[a-f0-9]{64}$/.test(body.taskKey)) {
+        throw new Error("taskKey is invalid");
+      }
       const preferences = this.getPreferences();
       if (request.url === "/v1/turn/start") {
-        const lease = host.beginTurn(body.traceId, preferences.showBrowserDuringTurns === true, body.helperPid);
+        const lease = body.taskKey === undefined
+          ? host.beginTurn(body.traceId, preferences.showBrowserDuringTurns === true, body.helperPid)
+          : host.beginTurn(
+            body.traceId,
+            preferences.showBrowserDuringTurns === true,
+            body.helperPid,
+            body.taskKey,
+          );
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
         return;

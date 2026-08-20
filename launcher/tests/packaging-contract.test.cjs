@@ -98,12 +98,13 @@ test("CI packages and smoke-launches on macOS, Windows, and Linux", () => {
 test("release publishes the repository demo as a checksummed versioned asset", () => {
   const release = fs.readFileSync(path.join(repositoryRoot, ".github", "workflows", "release.yml"), "utf8");
   const demo = fs.readFileSync(path.join(repositoryRoot, "assets", "demo.gif"));
-  const demoCopy = 'cp assets/demo.gif "release-assets/codex-web-gpt-${GITHUB_REF_NAME#v}-demo.gif"';
+  const demoCopy = /cp assets\/demo\.gif "release-assets\/codex-web-gpt-\$\{(?:GITHUB_REF_NAME#v|version)\}-demo\.gif"/;
   const checksumStep = release.indexOf("- name: Create checksums");
   assert.equal(demo.subarray(0, 6).toString("ascii"), "GIF89a");
-  assert.ok(release.includes(demoCopy));
+  const demoCopyMatch = release.match(demoCopy);
+  assert.ok(demoCopyMatch);
   assert.ok(
-    release.indexOf(demoCopy) < checksumStep,
+    release.indexOf(demoCopyMatch[0]) < checksumStep,
     "the versioned demo must enter release-assets before checksums are generated",
   );
   assert.match(release.slice(checksumStep), /find \. -maxdepth 1 -type f ! -name checksums\.txt/);

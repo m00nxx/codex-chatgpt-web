@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { applyChatGptContextSpoolDisposition } from "../src/adapters/chatgpt-web/browser-worker";
 import { createChatGptContextSpool } from "../src/adapters/chatgpt-web/context-spool";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
@@ -255,6 +256,93 @@ test("turn broker delivers and acknowledges context strictly before normal tools
       bindingId: cancelled.bindingId,
       cursor: 0,
     })).rejects.toThrow("has already finished");
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("browser resolves a dormant delta fallback spool before either transport can continue", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-fallback-spool-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const environment = {
+    cwd: root,
+    roots: [root],
+    writableRoots: [root],
+    sandboxPolicy: { type: "dangerFullAccess" as const },
+    tools: [],
+  };
+  const register = async (traceId: string) => {
+    const token = await broker.register(environment, 60_000, traceId);
+    const spool = createChatGptContextSpool("fallback context");
+    broker.attachContextSpool(token, spool, { pending: true, contextOnly: true });
+    const prepared = {
+      text: "delta",
+      images: [],
+      continuum: {
+        taskKey: "a".repeat(64),
+        plannedMode: "delta" as const,
+        reason: "acknowledged_prefix",
+        marker: "next-marker",
+        expectedPreviousMarker: "previous-marker",
+        fullFallback: { text: "bootstrap", images: [] },
+      },
+      contextSpoolControl: {
+        brokerSocketPath: socketPath,
+        turnToken: token,
+        activateOn: "continuum_full_fallback" as const,
+      },
+    };
+    return { token, spool, prepared };
+  };
+  try {
+    const skipped = await register("fallback-skipped");
+    await applyChatGptContextSpoolDisposition(skipped.prepared, false);
+    expect(() => broker.assertContextSpoolComplete(skipped.token)).not.toThrow();
+    const skippedClaim = await callTurnBroker<{ bindingId: string }>(socketPath, {
+      method: "claim",
+      token: skipped.token,
+    });
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: skippedClaim.bindingId,
+      cursor: 0,
+    })).rejects.toThrow("not active");
+
+    const required = await register("fallback-required");
+    await applyChatGptContextSpoolDisposition(required.prepared, true);
+    const requiredClaim = await callTurnBroker<{ bindingId: string }>(socketPath, {
+      method: "claim",
+      token: required.token,
+    });
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: requiredClaim.bindingId,
+      cursor: 0,
+    })).resolves.toMatchObject({ chunk: "fallback context", next_cursor: 1 });
+    await callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: requiredClaim.bindingId,
+      cursor: 1,
+      acknowledgedRootDigest: required.spool.rootDigest,
+    });
+    expect(() => broker.assertContextSpoolComplete(required.token)).not.toThrow();
+    await expect(callTurnBroker(socketPath, {
+      method: "resolve",
+      bindingId: requiredClaim.bindingId,
+    })).rejects.toThrow("restricted to the ChatGPT context spool");
+    expect(() => broker.assertContextSpoolComplete(required.token)).toThrow("failed closed");
+
+    const unresolved = await register("fallback-unresolved");
+    expect(() => broker.assertContextSpoolComplete(unresolved.token))
+      .toThrow("did not resolve whether the context spool was required");
+
+    const conflicting = await register("fallback-conflicting");
+    await applyChatGptContextSpoolDisposition(conflicting.prepared, true);
+    await expect(applyChatGptContextSpoolDisposition(conflicting.prepared, false))
+      .rejects.toThrow("conflicting context spool dispositions");
+    expect(() => broker.assertContextSpoolComplete(conflicting.token)).toThrow("failed closed");
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });

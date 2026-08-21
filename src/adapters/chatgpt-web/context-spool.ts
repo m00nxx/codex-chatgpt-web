@@ -150,6 +150,7 @@ export function compileChatGptContextSpoolBootstrap(
   turnToken: string,
   spool: ChatGptContextSpool,
   continuumMarker?: string,
+  options: { contextOnlyToken?: boolean } = {},
 ): string {
   const finalCursor = spool.chunks.length;
   return [
@@ -160,6 +161,10 @@ export function compileChatGptContextSpoolBootstrap(
     `root_digest: ${spool.rootDigest}`,
     `total_chunks: ${finalCursor}`,
     `chunk_char_limit: ${CHATGPT_CONTEXT_SPOOL_CHUNK_CHARS}`,
+    ...(options.contextOnlyToken ? [
+      "This bootstrap turn_token is restricted to codex_context_next. Never use it for any other tool.",
+      "After reconstruction, use only the separate current turn_token stated by the authoritative transport prompt for normal Codex Native tools.",
+    ] : []),
     "Mandatory protocol:",
     `1. Before reasoning about the task, answering, or calling any other tool, call codex_context_next with turn_token ${turnToken} and cursor 0.`,
     "2. Follow each returned next_cursor exactly. Preserve every returned chunk field verbatim and in index order. Do not summarize, omit, normalize, or reorder it.",
@@ -203,8 +208,9 @@ function spoolAggregateInputTokens(
 /**
  * Select a context spool only for a full, tool-capable prompt that exceeds a measured one-message
  * transport boundary while still fitting the underlying model context after conservative tool
- * result overhead. A delta must first be selected against the retained browser transcript, so the
- * prototype deliberately leaves delta fallback handling to the existing fail-closed preflight.
+ * result overhead. A top-level delta is not replaced here: the adapter prepares its complete
+ * fallback separately under a dormant context-only token, then the browser resolves that token
+ * only after retained-transcript verification selects delta or full transport.
  */
 export function selectChatGptContextSpool(
   compiled: CompiledChatGptWebPrompt,
@@ -212,6 +218,7 @@ export function selectChatGptContextSpool(
   modelId: ChatGptWebBackendModel,
   effort: ChatGptWebModelMode["effort"],
   capabilities: ChatGptWebCapabilities,
+  options: { contextOnlyToken?: boolean } = {},
 ): ChatGptContextSpoolSelection {
   if (compiled.continuum?.plannedMode === "delta") {
     return { prepared: compiled, reason: "delta_requires_browser_verification" };
@@ -253,6 +260,7 @@ export function selectChatGptContextSpool(
     turnToken,
     spool,
     compiled.continuum?.marker,
+    options,
   );
   const bootstrapTokens = estimateTokens(bootstrap, modelId);
   if ((transport.browserComposerCharLimit !== undefined

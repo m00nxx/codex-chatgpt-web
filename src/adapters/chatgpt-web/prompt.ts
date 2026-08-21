@@ -27,9 +27,18 @@ export interface CompiledChatGptWebPrompt {
     /** Complete reset prompt selected when the task-bound browser transcript cannot be proven. */
     fullFallback?: ChatGptWebPromptPayload;
   };
+  /** Private browser-helper control data; never inserted into the visible ChatGPT prompt. */
+  contextSpoolControl?: {
+    brokerSocketPath: string;
+    turnToken: string;
+    activateOn: "continuum_full_fallback";
+  };
 }
 
-export type ChatGptWebPromptPayload = Omit<CompiledChatGptWebPrompt, "continuum">;
+export type ChatGptWebPromptPayload = Omit<
+  CompiledChatGptWebPrompt,
+  "continuum" | "contextSpoolControl"
+>;
 
 export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;

@@ -17,6 +17,7 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   expect(runBrowserTurn).toContain('.getByTestId("send-button")');
   expect(runBrowserTurn).toContain('await sendButton.press("Enter")');
   expect(runBrowserTurn).toContain("await this.waitForSubmissionAccepted(");
+  expect(runBrowserTurn).toContain("await applyChatGptContextSpoolDisposition(");
   expect(runBrowserTurn).not.toContain("userTurns.nth(initialUserTurnCount).waitFor");
   expect(workerSource).not.toMatch(/\bclipboard\b|pbcopy|pbpaste/i);
 });

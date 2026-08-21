@@ -346,11 +346,29 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     const token = deferred<string>();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const finalizeContextSpool = (browser: Promise<string>): Promise<string> => browser.then(answer => {
-      if (!activeToken) throw new Error("ChatGPT context spool lost its active turn token");
-      broker.assertContextSpoolComplete(activeToken);
-      return answer;
-    });
+    const fallbackSpoolTokens = new Set<string>();
+    const revokeFallbackSpoolTokens = (): void => {
+      for (const fallbackToken of fallbackSpoolTokens) broker.revoke(fallbackToken);
+      fallbackSpoolTokens.clear();
+    };
+    const finalizeContextSpool = (browser: Promise<string>): Promise<string> => browser.then(
+      answer => {
+        try {
+          if (!activeToken) throw new Error("ChatGPT context spool lost its active turn token");
+          broker.assertContextSpoolComplete(activeToken);
+          for (const fallbackToken of fallbackSpoolTokens) {
+            broker.assertContextSpoolComplete(fallbackToken);
+          }
+          return answer;
+        } finally {
+          revokeFallbackSpoolTokens();
+        }
+      },
+      error => {
+        revokeFallbackSpoolTokens();
+        throw error;
+      }
+    );
     const browser = finalizeCheckpoint(finalizeContinuum(finalizeContextSpool(runBrowser({
       traceId,
       modelId: parsed.modelId,
@@ -385,13 +403,71 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               `[chatgpt-web] context spool selected chunks=${selection.spool.chunks.length}`
               + ` aggregateEstimatedInputTokens=${selection.aggregateInputTokens ?? "unknown"}`,
             );
-          } else if (selection.reason !== "not_needed"
-            && selection.reason !== "delta_requires_browser_verification") {
+          } else if (selection.reason === "delta_requires_browser_verification"
+            && compiled.continuum?.fullFallback) {
+            const fallbackToken = await broker.register(
+              environment,
+              timeoutMs === undefined ? undefined : timeoutMs + 60_000,
+              `${traceId}-fallback`,
+            );
+            fallbackSpoolTokens.add(fallbackToken);
+            const fallbackSelection = selectChatGptContextSpool(
+              {
+                ...compiled.continuum.fullFallback,
+                continuum: {
+                  taskKey: compiled.continuum.taskKey,
+                  plannedMode: "full",
+                  reason: "browser_full_fallback",
+                  marker: compiled.continuum.marker,
+                },
+              },
+              fallbackToken,
+              mode.modelId,
+              mode.effort,
+              turnCapabilities,
+              { contextOnlyToken: true },
+            );
+            if (fallbackSelection.spool) {
+              broker.attachContextSpool(fallbackToken, fallbackSelection.spool, {
+                pending: true,
+                contextOnly: true,
+              });
+              const {
+                continuum: _fallbackContinuum,
+                contextSpoolControl: _fallbackControl,
+                ...fullFallback
+              } = fallbackSelection.prepared;
+              console.info(
+                `[chatgpt-web] context spool prepared for browser full fallback`
+                + ` chunks=${fallbackSelection.spool.chunks.length}`
+                + ` aggregateEstimatedInputTokens=${fallbackSelection.aggregateInputTokens ?? "unknown"}`,
+              );
+              return {
+                ...compiled,
+                continuum: { ...compiled.continuum, fullFallback },
+                contextSpoolControl: {
+                  brokerSocketPath: broker.socketPath,
+                  turnToken: fallbackToken,
+                  activateOn: "continuum_full_fallback",
+                },
+                release: () => {},
+              };
+            }
+            broker.revoke(fallbackToken);
+            fallbackSpoolTokens.delete(fallbackToken);
+            if (fallbackSelection.reason !== "not_needed") {
+              console.info(
+                `[chatgpt-web] context spool not prepared for browser full fallback`
+                + ` reason=${fallbackSelection.reason}`,
+              );
+            }
+          } else if (selection.reason !== "not_needed") {
             console.info(`[chatgpt-web] context spool not selected reason=${selection.reason}`);
           }
           return { ...selection.prepared, release: () => {} };
         } catch (error) {
           broker.revoke(turnToken);
+          revokeFallbackSpoolTokens();
           throw error;
         }
       },
@@ -419,6 +495,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       cancel: () => {
         browserAbort.abort();
         if (activeToken) broker.revoke(activeToken);
+        revokeFallbackSpoolTokens();
       },
     };
   };

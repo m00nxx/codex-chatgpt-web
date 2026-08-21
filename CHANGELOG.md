@@ -15,6 +15,9 @@ backend: this fork does not replace it with API credits or reduce it to a second
   additional browser messages or open retry chats.
 - Added a SHA-256 root digest, per-chunk hash chain, strict cursor ordering, idempotent last-chunk
   replay, and an explicit final root acknowledgement before task execution can begin.
+- Added a dormant, context-only token for an oversized Continuum `DELTA → FULL` browser fallback.
+  The browser must resolve its actual transport before prompt attachment: a proven delta discards
+  the unused spool, while a full reset activates it inside the same response.
 - Added an account-scoped browser send gate with configurable minimum spacing and a persisted
   cooldown after a real ChatGPT `429` response.
 - Added launcher visibility for the transport actually selected after browser proof: `FULL`,
@@ -36,9 +39,9 @@ backend: this fork does not replace it with API credits or reduce it to a second
 
 ### Safety
 
-- Context spooling is never selected to exceed the model context window, never applies to an
-  unverified delta fallback, and never truncates the compiled prompt. Excessive spool size or
-  overhead leaves the existing explicit context error unchanged.
+- Context spooling is never selected to exceed the model context window and never truncates the
+  compiled prompt. An unresolved or conflicting delta/full browser decision fails closed;
+  excessive spool size or overhead leaves the existing explicit context error unchanged.
 - A skipped cursor, digest mismatch, early normal tool, early final answer, cancellation, or broker
   loss permanently fails that browser attempt closed; no Continuum acknowledgement is committed.
 - A request observed during a rate-limit cooldown fails locally and is never queued to become an

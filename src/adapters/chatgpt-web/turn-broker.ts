@@ -44,9 +44,11 @@ interface ToolWaiter {
 }
 
 interface TurnContextSpoolState {
-  spool: ChatGptContextSpool;
+  spool?: ChatGptContextSpool;
   nextCursor: number;
   acknowledged: boolean;
+  disposition: "pending" | "required" | "skipped";
+  contextOnly: boolean;
   failure?: string;
 }
 
@@ -63,7 +65,7 @@ interface TurnChannel {
 
 interface BrokerRequest {
   id: string;
-  method: "claim" | "resolve" | "release" | "invoke" | "context_next";
+  method: "claim" | "resolve" | "release" | "invoke" | "context_next" | "context_spool_disposition";
   token?: string;
   bindingId?: string;
   wireName?: string;
@@ -72,6 +74,7 @@ interface BrokerRequest {
   input?: string;
   cursor?: number;
   acknowledgedRootDigest?: string;
+  required?: boolean;
 }
 
 interface BrokerResponse {
@@ -186,7 +189,11 @@ export class TurnBroker {
     };
   }
 
-  attachContextSpool(token: string, spool: ChatGptContextSpool): void {
+  attachContextSpool(
+    token: string,
+    spool: ChatGptContextSpool,
+    options: { pending?: boolean; contextOnly?: boolean } = {},
+  ): void {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
@@ -200,7 +207,13 @@ export class TurnBroker {
       rootDigest: spool.rootDigest,
       chunks: Object.freeze(spool.chunks.map(chunk => Object.freeze({ ...chunk }))) as unknown as ChatGptContextSpool["chunks"],
     });
-    channel.contextSpool = { spool: immutableSpool, nextCursor: 0, acknowledged: false };
+    channel.contextSpool = {
+      spool: immutableSpool,
+      nextCursor: 0,
+      acknowledged: false,
+      disposition: options.pending ? "pending" : "required",
+      contextOnly: options.contextOnly === true,
+    };
   }
 
   assertContextSpoolComplete(token: string): void {
@@ -210,6 +223,11 @@ export class TurnBroker {
     if (channel.contextSpool?.failure) {
       throw new Error(`ChatGPT context spool failed closed: ${channel.contextSpool.failure}`);
     }
+    if (channel.contextSpool?.disposition === "pending") {
+      channel.contextSpool.failure = "the browser did not resolve the context spool disposition";
+      throw new Error("ChatGPT browser did not resolve whether the context spool was required");
+    }
+    if (channel.contextSpool?.disposition === "skipped") return;
     if (channel.contextSpool && !channel.contextSpool.acknowledged) {
       channel.contextSpool.failure = "the browser returned a final answer before context acknowledgement";
       throw new Error(
@@ -420,7 +438,8 @@ export class TurnBroker {
       && request.method !== "resolve"
       && request.method !== "release"
       && request.method !== "invoke"
-      && request.method !== "context_next") {
+      && request.method !== "context_next"
+      && request.method !== "context_spool_disposition") {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -454,6 +473,30 @@ export class TurnBroker {
       channel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel });
       return { bindingId, environment: channel.environment };
+    }
+
+    if (request.method === "context_spool_disposition") {
+      const token = request.token;
+      if (typeof token !== "string" || token.length === 0) throw new Error("turn token is required");
+      if (typeof request.required !== "boolean") {
+        throw new Error("ChatGPT context spool disposition requires a boolean decision");
+      }
+      const channel = this.channels.get(token);
+      if (!channel) throw new Error("turn token is invalid or expired");
+      const state = channel.contextSpool;
+      if (!state) throw new Error("ChatGPT context spool is not enabled for this turn");
+      if (state.failure) throw new Error(`ChatGPT context spool failed closed: ${state.failure}`);
+      const disposition = request.required ? "required" : "skipped";
+      if (state.disposition !== "pending" && state.disposition !== disposition) {
+        state.failure = "the browser reported conflicting context spool dispositions";
+        throw new Error("ChatGPT browser reported conflicting context spool dispositions");
+      }
+      state.disposition = disposition;
+      if (disposition === "skipped") state.spool = undefined;
+      console.info(
+        `[chatgpt-web] broker trace=${channel.traceId} context spool disposition=${disposition}`,
+      );
+      return { disposition };
     }
 
     const bindingId = request.bindingId;
@@ -522,7 +565,21 @@ export class TurnBroker {
     if (channel.contextSpool?.failure) {
       throw new Error(`ChatGPT context spool failed closed: ${channel.contextSpool.failure}`);
     }
-    if (channel.contextSpool && !channel.contextSpool.acknowledged) {
+    if (channel.contextSpool?.contextOnly) {
+      this.failContextSpool(
+        channel,
+        "a normal Codex Native tool used a context-only fallback token",
+        "This turn token is restricted to the ChatGPT context spool",
+      );
+    }
+    if (channel.contextSpool?.disposition === "pending") {
+      this.failContextSpool(
+        channel,
+        "a tool was requested before the browser resolved the context spool disposition",
+        "ChatGPT context spool disposition is not resolved",
+      );
+    }
+    if (channel.contextSpool?.disposition === "required" && !channel.contextSpool.acknowledged) {
       this.failContextSpool(
         channel,
         "another Codex Native tool was requested before context acknowledgement",
@@ -544,7 +601,15 @@ export class TurnBroker {
     const state = channel.contextSpool;
     if (!state) throw new Error("ChatGPT context spool is not enabled for this turn");
     if (state.failure) throw new Error(`ChatGPT context spool failed closed: ${state.failure}`);
-    const total = state.spool.chunks.length;
+    if (state.disposition !== "required" || !state.spool) {
+      this.failContextSpool(
+        channel,
+        `context was requested while spool disposition was ${state.disposition}`,
+        "ChatGPT context spool is not active for this browser transport",
+      );
+    }
+    const spool = state.spool;
+    const total = spool.chunks.length;
 
     if (cursor === total) {
       if (state.nextCursor !== total) {
@@ -554,7 +619,7 @@ export class TurnBroker {
           `ChatGPT context spool cursor is out of order: expected ${state.nextCursor}, received ${cursor}`,
         );
       }
-      if (acknowledgedRootDigest !== state.spool.rootDigest) {
+      if (acknowledgedRootDigest !== spool.rootDigest) {
         this.failContextSpool(
           channel,
           "the completion root digest did not match",
@@ -565,7 +630,7 @@ export class TurnBroker {
       console.info(
         `[chatgpt-web] broker trace=${channel.traceId} context spool acknowledged chunks=${total}`,
       );
-      return chatGptContextSpoolCompletePayload(state.spool);
+      return chatGptContextSpoolCompletePayload(spool);
     }
 
     if (acknowledgedRootDigest !== undefined) {
@@ -576,7 +641,7 @@ export class TurnBroker {
       );
     }
     if (cursor === state.nextCursor) {
-      const payload = chatGptContextSpoolChunkPayload(state.spool, cursor);
+      const payload = chatGptContextSpoolChunkPayload(spool, cursor);
       state.nextCursor += 1;
       console.info(
         `[chatgpt-web] broker trace=${channel.traceId} context spool delivered chunk=${cursor + 1}/${total}`,
@@ -584,7 +649,7 @@ export class TurnBroker {
       return payload;
     }
     if (cursor === state.nextCursor - 1) {
-      return chatGptContextSpoolChunkPayload(state.spool, cursor);
+      return chatGptContextSpoolChunkPayload(spool, cursor);
     }
     this.failContextSpool(
       channel,

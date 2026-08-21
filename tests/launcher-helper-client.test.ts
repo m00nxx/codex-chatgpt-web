@@ -29,6 +29,8 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
         || continuum.taskKey !== "${"a".repeat(64)}"
         || continuum.plannedMode !== "delta"
         || continuum.fullFallback?.text !== "full reset"
+        || message.turn.prepared.contextSpoolControl?.turnToken !== "turn_fallback_12345678901234567890"
+        || message.turn.prepared.contextSpoolControl?.activateOn !== "continuum_full_fallback"
         || message.turn.prepared.trimmedCompactionMessages !== 3) {
         send({ type: "error", id: message.id, name: "Error", message: "prepared metadata was lost" });
         return;
@@ -101,6 +103,11 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
           marker: '<codex_continuum_state version="1" />',
           expectedPreviousMarker: '<codex_continuum_state version="1" previous="true" />',
           fullFallback: { text: "full reset", images: [] },
+        },
+        contextSpoolControl: {
+          brokerSocketPath: "local-test-broker",
+          turnToken: "turn_fallback_12345678901234567890",
+          activateOn: "continuum_full_fallback",
         },
         release: () => { released = true; },
       }),

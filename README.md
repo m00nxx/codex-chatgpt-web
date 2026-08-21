@@ -24,7 +24,8 @@ their subscription allows. ChatGPT Web Continuum binds each Codex task to one Te
 first turn transfers the required compiled context, later turns send only the locally proven delta.
 When a full tool-capable turn exceeds only ChatGPT's one-message boundary, the unreleased context
 spool can transfer that same immutable prompt through ordered read-only MCP results inside the one
-browser response; it never expands the model context window.
+browser response, including a full reset selected after retained-transcript verification; it never
+expands the model context window.
 Images, visible reasoning, tool activity, and Markdown still stream back into the same Codex task.
 
 <p align="center">

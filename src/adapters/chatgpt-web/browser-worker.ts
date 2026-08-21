@@ -62,6 +62,7 @@ import {
   ChatGptLunaCheckpointStream,
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
+import { callTurnBroker } from "./turn-broker";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
@@ -100,6 +101,24 @@ export function resolveChatGptContinuumTransportStatus(
     resetToFull: true,
     forceFreshSurface: launcherSurfaceResumed,
   };
+}
+
+export async function applyChatGptContextSpoolDisposition(
+  prepared: CompiledChatGptWebPrompt,
+  resetToFull: boolean,
+): Promise<void> {
+  const control = prepared.contextSpoolControl;
+  if (!control) return;
+  if (control.activateOn !== "continuum_full_fallback"
+    || prepared.continuum?.plannedMode !== "delta"
+    || !prepared.continuum.fullFallback) {
+    throw new Error("ChatGPT context spool control is inconsistent with the Continuum delta fallback");
+  }
+  await callTurnBroker(control.brokerSocketPath, {
+    method: "context_spool_disposition",
+    token: control.turnToken,
+    required: resetToFull,
+  });
 }
 
 const workers = new Map<string, ChatGptBrowserWorker>();
@@ -2048,6 +2067,10 @@ export class ChatGptBrowserWorker {
         originalPrepared.continuum,
         launcherSurfaceResumed,
         markerMatches,
+      );
+      await applyChatGptContextSpoolDisposition(
+        originalPrepared,
+        continuumStatus.resetToFull,
       );
       continuumTransport = continuumStatus.mode;
       continuumReason = continuumStatus.reason;

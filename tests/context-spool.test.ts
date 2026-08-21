@@ -74,7 +74,7 @@ test("context spool never bypasses the underlying model context window", () => {
   expect(selection.prepared.text).toBe(original);
 });
 
-test("delta and unbounded spools remain on the existing fail-closed path", () => {
+test("top-level delta selection is delegated and unbounded spools remain fail-closed", () => {
   const delta: CompiledChatGptWebPrompt = {
     text: " ".repeat(220_000),
     images: [],
@@ -106,4 +106,9 @@ test("bootstrap preserves the Continuum transcript marker", () => {
   const bootstrap = compileChatGptContextSpoolBootstrap(turnToken, spool, marker);
   expect(bootstrap).toContain(marker);
   expect(bootstrap).not.toContain("authoritative context");
+  const contextOnly = compileChatGptContextSpoolBootstrap(turnToken, spool, marker, {
+    contextOnlyToken: true,
+  });
+  expect(contextOnly).toContain("restricted to codex_context_next");
+  expect(contextOnly).toContain("separate current turn_token");
 });

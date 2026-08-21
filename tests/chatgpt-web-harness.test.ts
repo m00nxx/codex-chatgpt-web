@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, applyChatGptContextSpoolDisposition, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { createChatGptContextSpool } from "../src/adapters/chatgpt-web/context-spool";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
@@ -1324,6 +1324,180 @@ describe("ChatGPT outer-native harness v4", () => {
         event => events.push(event),
       )).rejects.toThrow("before acknowledging the complete context spool");
       expect(events.some(event => event.type === "done")).toBe(false);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
+  test("spools only the browser-selected full fallback while a proven delta stays inline", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-spool-fallback-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://context-spool-fallback-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        browserMinSendIntervalMs: 0,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: false,
+        contextMode: "stateful",
+        continuumStatePath: join(tempRoot, `continuum-spool-fallback-${Date.now()}.json`),
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const oversized = " ".repeat(220_000);
+    const answers = ["first large answer", "proven delta answer", "fallback reset answer"];
+    const reconstructed: string[] = [];
+    const fallbackTokens: string[] = [];
+    let browserStarts = 0;
+
+    const consumeSpool = async (text: string): Promise<string> => {
+      const token = text.match(/turn_token: (turn_[A-Za-z0-9_-]+)/)?.[1];
+      const rootDigest = text.match(/root_digest: ([a-f0-9]{64})/)?.[1];
+      const totalChunks = Number(text.match(/total_chunks: (\d+)/)?.[1]);
+      if (!token || !rootDigest || !Number.isInteger(totalChunks)) {
+        throw new Error("context spool bootstrap metadata is missing");
+      }
+      const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, {
+        method: "claim",
+        token,
+      });
+      let value = "";
+      for (let cursor = 0; cursor < totalChunks; cursor += 1) {
+        const chunk = await callTurnBroker<{ chunk: string }>(socketPath, {
+          method: "context_next",
+          bindingId: claimed.bindingId,
+          cursor,
+        });
+        value += chunk.chunk;
+      }
+      await callTurnBroker(socketPath, {
+        method: "context_next",
+        bindingId: claimed.bindingId,
+        cursor: totalChunks,
+        acknowledgedRootDigest: rootDigest,
+      });
+      expect(createHash("sha256").update(value).digest("hex")).toBe(rootDigest);
+      reconstructed.push(value);
+      return value;
+    };
+
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      const index = browserStarts;
+      browserStarts += 1;
+      try {
+        if (index === 0) {
+          expect(prepared.continuum?.plannedMode).toBe("full");
+          expect(prepared.contextSpoolControl).toBeUndefined();
+          await consumeSpool(prepared.text);
+        } else if (index === 1) {
+          expect(prepared.continuum?.plannedMode).toBe("delta");
+          expect(prepared.contextSpoolControl).toBeDefined();
+          fallbackTokens.push(prepared.contextSpoolControl!.turnToken);
+          expect(prepared.text).toContain("small delta two");
+          expect(prepared.text).not.toContain(oversized);
+          expect(prepared.continuum?.fullFallback?.text).toContain("codex_context_spool");
+          await applyChatGptContextSpoolDisposition(prepared, false);
+        } else if (index === 2) {
+          expect(prepared.continuum?.plannedMode).toBe("delta");
+          expect(prepared.contextSpoolControl).toBeDefined();
+          fallbackTokens.push(prepared.contextSpoolControl!.turnToken);
+          await applyChatGptContextSpoolDisposition(prepared, true);
+          const fullFallback = prepared.continuum?.fullFallback;
+          if (!fullFallback) throw new Error("spooled full fallback is missing");
+          const full = await consumeSpool(fullFallback.text);
+          expect(full).toContain(oversized);
+          expect(full).toContain(answers[0]!);
+          expect(full).toContain(answers[1]!);
+          expect(full).toContain("small delta three");
+        } else {
+          expect(prepared.contextSpoolControl).toBeDefined();
+          fallbackTokens.push(prepared.contextSpoolControl!.turnToken);
+          throw new Error("simulated browser failure before fallback disposition");
+        }
+        const answer = answers[index]!;
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    const request = (
+      messages: CodexParsedRequest["context"]["messages"],
+      turnId: string,
+      currentText: string,
+    ) => {
+      const value = rawWireRequest(environmentXml);
+      value.options.reasoning = "low";
+      value.context.messages = messages;
+      const raw = value._rawBody as {
+        client_metadata: Record<string, unknown>;
+        input: Array<{ content: Array<{ type: string; text: string }>; internal_chat_message_metadata_passthrough?: { turn_id: string } }>;
+      };
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+        thread_id: "thread_test_123",
+        turn_id: turnId,
+      });
+      raw.input.at(-1)!.content = [{ type: "input_text", text: currentText }];
+      raw.input.at(-1)!.internal_chat_message_metadata_passthrough = { turn_id: turnId };
+      return value;
+    };
+
+    const firstMessages: CodexParsedRequest["context"]["messages"] = [
+      { role: "user", content: oversized, timestamp: 1 },
+    ];
+    const secondMessages: CodexParsedRequest["context"]["messages"] = [
+      ...firstMessages,
+      { role: "assistant", phase: "final_answer", content: [{ type: "text", text: answers[0]! }], timestamp: 2 },
+      { role: "user", content: "small delta two", timestamp: 3 },
+    ];
+    const thirdMessages: CodexParsedRequest["context"]["messages"] = [
+      ...secondMessages,
+      { role: "assistant", phase: "final_answer", content: [{ type: "text", text: answers[1]! }], timestamp: 4 },
+      { role: "user", content: "small delta three", timestamp: 5 },
+    ];
+    const fourthMessages: CodexParsedRequest["context"]["messages"] = [
+      ...thirdMessages,
+      { role: "assistant", phase: "final_answer", content: [{ type: "text", text: answers[2]! }], timestamp: 6 },
+      { role: "user", content: "small delta four", timestamp: 7 },
+    ];
+
+    const adapter = createChatGptWebAdapter(provider);
+    try {
+      for (const [parsedRequest, answer] of [
+        [request(firstMessages, "turn_test_123", oversized), answers[0]],
+        [request(secondMessages, "turn_spool_2", "small delta two"), answers[1]],
+        [request(thirdMessages, "turn_spool_3", "small delta three"), answers[2]],
+      ] as const) {
+        const events: AdapterEvent[] = [];
+        await adapter.runTurn!(
+          parsedRequest,
+          { headers: new Headers() },
+          event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+        expect(events.some(event => event.type === "text_delta" && event.text === answer)).toBe(true);
+      }
+      const failedEvents: AdapterEvent[] = [];
+      await expect(adapter.runTurn!(
+        request(fourthMessages, "turn_spool_4", "small delta four"),
+        { headers: new Headers() },
+        event => failedEvents.push(event),
+      )).rejects.toThrow("simulated browser failure before fallback disposition");
+      expect(failedEvents.some(event => event.type === "done")).toBe(false);
+      expect(browserStarts).toBe(4);
+      expect(reconstructed).toHaveLength(2);
+      expect(fallbackTokens).toHaveLength(3);
+      for (const fallbackToken of fallbackTokens) {
+        await expect(callTurnBroker(socketPath, {
+          method: "claim",
+          token: fallbackToken,
+        })).rejects.toThrow(/invalid or expired|already finished/);
+      }
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();

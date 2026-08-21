@@ -65,6 +65,43 @@ import {
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
+export type ChatGptContinuumTransportStatus = {
+  mode: "stateless" | "full" | "delta";
+  reason: string;
+};
+
+export function resolveChatGptContinuumTransportStatus(
+  continuum: CompiledChatGptWebPrompt["continuum"],
+  launcherSurfaceResumed: boolean,
+  markerMatches = false,
+): ChatGptContinuumTransportStatus & { resetToFull: boolean; forceFreshSurface: boolean } {
+  if (!continuum) {
+    return { mode: "stateless", reason: "stateless", resetToFull: false, forceFreshSurface: false };
+  }
+  if (continuum.plannedMode === "full") {
+    return {
+      mode: "full",
+      reason: continuum.reason,
+      resetToFull: false,
+      forceFreshSurface: launcherSurfaceResumed,
+    };
+  }
+  if (launcherSurfaceResumed && markerMatches) {
+    return {
+      mode: "delta",
+      reason: "acknowledged_prefix",
+      resetToFull: false,
+      forceFreshSurface: false,
+    };
+  }
+  return {
+    mode: "full",
+    reason: launcherSurfaceResumed ? "browser_marker_mismatch" : "surface_missing",
+    resetToFull: true,
+    forceFreshSurface: launcherSurfaceResumed,
+  };
+}
+
 const workers = new Map<string, ChatGptBrowserWorker>();
 
 export async function closeChatGptBrowserWorkers(): Promise<void> {
@@ -1868,6 +1905,15 @@ export class ChatGptBrowserWorker {
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
     let heartbeatInFlight = false;
     let lastHeartbeatFailureAt = 0;
+    let continuumStatus: ChatGptContinuumTransportStatus | undefined;
+    const reportHeartbeatFailure = (error: unknown) => {
+      const now = Date.now();
+      if (now - lastHeartbeatFailureAt < 30_000) return;
+      lastHeartbeatFailureAt = now;
+      console.warn(
+        `[chatgpt-web] launcher turn heartbeat failed for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    };
     const sendHeartbeat = () => {
       if (heartbeatInFlight) return;
       heartbeatInFlight = true;
@@ -1875,22 +1921,36 @@ export class ChatGptBrowserWorker {
         phase: "heartbeat",
         traceId: turn.traceId,
         helperPid: process.pid,
-      }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(error => {
-        const now = Date.now();
-        if (now - lastHeartbeatFailureAt < 30_000) return;
-        lastHeartbeatFailureAt = now;
-        console.warn(
-          `[chatgpt-web] launcher turn heartbeat failed for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }).finally(() => {
+        ...(continuumStatus ? {
+          continuumMode: continuumStatus.mode,
+          continuumReason: continuumStatus.reason,
+        } : {}),
+      }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(reportHeartbeatFailure).finally(() => {
         heartbeatInFlight = false;
       });
+    };
+    const reportContinuumStatus = async (status: ChatGptContinuumTransportStatus) => {
+      continuumStatus = status;
+      await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+        phase: "heartbeat",
+        traceId: turn.traceId,
+        helperPid: process.pid,
+        continuumMode: status.mode,
+        continuumReason: status.reason,
+      }, LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).catch(reportHeartbeatFailure);
     };
     try {
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
       preparedOwnedByRun = true;
-      return await this.runBrowserTurn(turn, surfaceId, undefined, prepared, lease.resumed === true);
+      return await this.runBrowserTurn(
+        turn,
+        surfaceId,
+        undefined,
+        prepared,
+        lease.resumed === true,
+        reportContinuumStatus,
+      );
     } catch (error) {
       originalError = error;
       terminal = error instanceof DOMException && error.name === "AbortError" ? "aborted" : "failed";
@@ -1922,6 +1982,7 @@ export class ChatGptBrowserWorker {
     maintenancePage?: Page,
     precompiled?: CompiledChatGptWebPrompt & { release: () => void },
     launcherSurfaceResumed = false,
+    onContinuumStatus?: (status: ChatGptContinuumTransportStatus) => Promise<void>,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.captureLunaCheckpoint === true) !== (turn.onLunaCheckpoint !== undefined)) {
@@ -1936,6 +1997,7 @@ export class ChatGptBrowserWorker {
     let continuumTransport: "stateless" | "full" | "delta" = originalPrepared.continuum
       ? originalPrepared.continuum.plannedMode
       : "stateless";
+    let continuumReason = originalPrepared.continuum?.reason ?? "stateless";
     const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId);
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
@@ -1971,28 +2033,34 @@ export class ChatGptBrowserWorker {
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
       await diagnostics.capture(page, "browser-page-acquired");
-      let forceFreshContinuumSurface = false;
+      let markerMatches = false;
       if (originalPrepared.continuum) {
         const continuum = originalPrepared.continuum;
         if (continuum.plannedMode === "delta") {
           if (!continuum.fullFallback || !continuum.expectedPreviousMarker) {
             throw new Error("ChatGPT Continuum delta is missing its full reset fallback or prefix marker");
           }
-          const markerMatches = launcherSurfaceResumed
+          markerMatches = launcherSurfaceResumed
             && await this.retainedContinuumMarkerMatches(page, continuum.expectedPreviousMarker);
-          if (!markerMatches) {
-            prepared = { ...continuum.fullFallback, continuum, release: originalPrepared.release };
-            continuumTransport = "full";
-            forceFreshContinuumSurface = launcherSurfaceResumed;
-            console.warn(
-              `[chatgpt-web] Continuum reset selected for ${turn.traceId}`
-              + ` (surfaceResumed=${launcherSurfaceResumed}, prefixDigestVerified=${markerMatches})`,
-            );
-          }
-        } else if (launcherSurfaceResumed) {
-          forceFreshContinuumSurface = true;
         }
       }
+      const continuumStatus = resolveChatGptContinuumTransportStatus(
+        originalPrepared.continuum,
+        launcherSurfaceResumed,
+        markerMatches,
+      );
+      continuumTransport = continuumStatus.mode;
+      continuumReason = continuumStatus.reason;
+      const forceFreshContinuumSurface = continuumStatus.forceFreshSurface;
+      if (continuumStatus.resetToFull) {
+        const continuum = originalPrepared.continuum!;
+        prepared = { ...continuum.fullFallback!, continuum, release: originalPrepared.release };
+        console.warn(
+          `[chatgpt-web] Continuum reset selected for ${turn.traceId}`
+          + ` (surfaceResumed=${launcherSurfaceResumed}, prefixDigestVerified=${markerMatches})`,
+        );
+      }
+      await onContinuumStatus?.({ mode: continuumTransport, reason: continuumReason });
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
       const estimatedMessageTokens = estimateCompiledChatGptWebMessageTokens(prepared, turn.modelId);
       assertChatGptWebInputWithinLimits(

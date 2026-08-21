@@ -77,6 +77,11 @@ requires Codex compaction; it is never truncated silently. The runtime does not 
 JSONL file or upload a synthetic context document. Attachment acceptance, exact composer readback,
 submission evidence, and completed-turn evidence remain mandatory before acknowledgement.
 
+The worker reports the transport selected after retained-marker verification to the authenticated
+launcher control channel. The task tab displays `FULL`, `DELTA`, or `STATELESS`; local activity also
+records a bounded reset reason, never prompt or answer content. Completed task surfaces expire after
+two idle hours, while a running surface remains protected by its existing owner/heartbeat lease.
+
 The appended models advertise the authenticated account's context window and a ten-percent
 auto-compaction reserve. Usage is counted with the GPT-5 tokenizer plus fixed platform/image
 reserves, rather than inferred from character length. The ChatGPT composer also has an independent
@@ -147,6 +152,9 @@ launcher error.
   The selected routed model fixes the adapter effort; a conflicting request effort cannot change it.
 - Default automatic browser retries to zero. Explicit non-rate-limit retries have a bounded count
   and exponential backoff; a ChatGPT rate limit never sends another automatic message.
+- Serialize account-scoped browser-send reservations with a configurable minimum interval. Persist
+  a bounded cooldown after a real `429`; a request seen during cooldown fails immediately rather
+  than waiting to send later.
 - Do not retry or switch modes to evade product usage limits.
 
 See the complete [security model](security-model.md).

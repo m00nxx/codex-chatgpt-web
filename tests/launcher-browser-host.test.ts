@@ -108,8 +108,16 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
       phase: "heartbeat",
       traceId: "abc123def456",
       helperPid: process.pid,
+      continuumMode: "delta",
+      continuumReason: "acknowledged_prefix",
     });
-    expect(received.body).toEqual({ phase: "heartbeat", traceId: "abc123def456", helperPid: process.pid });
+    expect(received.body).toEqual({
+      phase: "heartbeat",
+      traceId: "abc123def456",
+      helperPid: process.pid,
+      continuumMode: "delta",
+      continuumReason: "acknowledged_prefix",
+    });
     await notifyLauncherTurn(path, {
       phase: "end",
       traceId: "abc123def456",

@@ -260,6 +260,12 @@ export interface CodexProviderConfig {
     browserTurnRetries?: number;
     /** Exponential backoff base for explicitly enabled browser retries. */
     browserRetryBackoffMs?: number;
+    /** Persisted account-scoped send spacing and rate-limit cooldown state. */
+    browserRateLimitStatePath?: string;
+    /** Minimum spacing between newly created ChatGPT browser sends. */
+    browserMinSendIntervalMs?: number;
+    /** Terminal cooldown applied after ChatGPT reports a rate limit. */
+    browserRateLimitCooldownMs?: number;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
     /** Keep the single controlled browser visible. */

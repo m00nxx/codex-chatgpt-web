@@ -27,6 +27,7 @@ const MAX_BROWSER_TABS = 5;
 const TURN_HEARTBEAT_SWEEP_MS = 5_000;
 const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
 const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
+const TASK_SURFACE_IDLE_TTL_MS = 2 * 60 * 60_000;
 const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000;
 const CHATGPT_AUTH_SESSION_TIMEOUT_MS = 5_000;
 const CHATGPT_PARTITION = "persist:codex-web-gpt-chatgpt";
@@ -255,6 +256,8 @@ class BrowserHost {
       loading: tab.loading === true,
       active: this.selectedTabId === tab.id,
       closable: true,
+      ...(tab.continuumMode ? { continuumMode: tab.continuumMode } : {}),
+      ...(tab.continuumReason ? { continuumReason: tab.continuumReason } : {}),
     };
   }
 
@@ -698,7 +701,7 @@ class BrowserHost {
     this.publishState?.(this.snapshot());
   }
 
-  heartbeatTurn(traceId, helperPid) {
+  heartbeatTurn(traceId, helperPid, continuumMode, continuumReason) {
     const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
     if (!tab) {
       const closedOwner = this.closedTurnOwners.get(traceId);
@@ -710,11 +713,41 @@ class BrowserHost {
     }
     if (tab.status !== "running") throw new Error(`Browser turn ${traceId} is no longer running`);
     tab.lastHeartbeatAt = Date.now();
+    if (continuumMode) {
+      const changed = tab.continuumMode !== continuumMode || tab.continuumReason !== continuumReason;
+      tab.continuumMode = continuumMode;
+      tab.continuumReason = continuumReason;
+      tab.message = continuumMode === "delta"
+        ? "ChatGPT Continuum: delta verified"
+        : continuumMode === "full"
+          ? `ChatGPT Continuum: full${continuumReason ? ` (${continuumReason.replaceAll("_", " ")})` : ""}`
+          : "ChatGPT Web: stateless";
+      if (changed) {
+        this.logger.info("browser.continuum_transport", {
+          tabId: tab.id,
+          traceId,
+          mode: continuumMode,
+          reason: continuumReason,
+        });
+        this.publishState?.(this.snapshot());
+      }
+    }
     return this.snapshot();
   }
 
   reapExpiredTurnTabs(now = Date.now()) {
     for (const tab of [...this.turnTabs.values()]) {
+      if (tab.status === "ready"
+        && tab.taskKey
+        && now - (tab.lastUsedAt ?? now) >= TASK_SURFACE_IDLE_TTL_MS) {
+        this.logger.info("browser.task_surface_expired", {
+          tabId: tab.id,
+          traceId: tab.traceId,
+          idleMs: now - (tab.lastUsedAt ?? now),
+        });
+        this.removeTurnTab(tab, false);
+        continue;
+      }
       if (tab.status !== "running") continue;
       const bootstrapExpired = tab.bootstrapReady !== true
         && now >= (tab.bootstrapDeadlineAt ?? Number.POSITIVE_INFINITY);
@@ -1057,6 +1090,8 @@ class BrowserHost {
       existing.status = "running";
       existing.loading = true;
       existing.message = "ChatGPT is working";
+      existing.continuumMode = undefined;
+      existing.continuumReason = undefined;
       existing.bootstrapReady = false;
       existing.bootstrapDeadlineAt = Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS;
       existing.lastHeartbeatAt = Date.now();

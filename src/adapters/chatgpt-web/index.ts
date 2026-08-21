@@ -5,11 +5,12 @@ import { namespacedToolName, type AdapterEvent, type CodexContentPart, type Code
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
-import { ChatGptBrowserWorker } from "./browser-worker";
+import { ChatGptBrowserWorker, type BrowserTurn } from "./browser-worker";
 import { sharedChatGptContinuumStore, type ChatGptContinuumPlan } from "./continuum";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "./prompt";
+import { sharedChatGptWebSendRateLimiter } from "./rate-limiter";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
@@ -191,6 +192,22 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
   const continuumEnabled = provider.chatgptWeb?.contextMode !== "stateless";
   const browserTurnRetries = provider.chatgptWeb?.browserTurnRetries ?? 0;
   const browserRetryBackoffMs = provider.chatgptWeb?.browserRetryBackoffMs ?? 2_000;
+  const browserMinSendIntervalMs = provider.chatgptWeb?.browserMinSendIntervalMs ?? 2_000;
+  const browserRateLimitCooldownMs = provider.chatgptWeb?.browserRateLimitCooldownMs ?? 120_000;
+  const accountNamespace = createHash("sha256").update(JSON.stringify({
+    browserHost: provider.chatgptWeb?.browserHost ?? "managed-chrome",
+    accountSurface: provider.chatgptWeb?.browserHostDescriptorPath
+      ?? provider.chatgptWeb?.storageStatePath
+      ?? provider.baseUrl,
+    chromeExecutablePath: provider.chatgptWeb?.chromeExecutablePath ?? "",
+  })).digest("hex");
+  const browserRateLimitStatePath = provider.chatgptWeb?.browserRateLimitStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.browserRateLimitStatePath))
+    : undefined;
+  const sendRateLimiter = sharedChatGptWebSendRateLimiter(
+    browserRateLimitStatePath,
+    accountNamespace,
+  );
   const environmentStore = new ChatGptThreadEnvironmentStore(
     provider.chatgptWeb?.threadEnvironmentStatePath
       ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
@@ -267,10 +284,33 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       return answer;
     });
     const browserAbort = new AbortController();
+    const runBrowser = (turn: BrowserTurn): Promise<string> => (async () => {
+      await sendRateLimiter.beforeSend(
+        browserMinSendIntervalMs,
+        browserRateLimitCooldownMs,
+        browserAbort.signal,
+        delayMs => console.info(
+          `[chatgpt-web] account send gate spacing a new browser turn by ${delayMs}ms`,
+        ),
+      );
+      try {
+        return await worker.run(turn);
+      } catch (error) {
+        if (error instanceof ChatGptWebAdapterError
+          && error.status === 429
+          && error.code === "rate_limit_exceeded") {
+          const cooldownUntil = sendRateLimiter.recordRateLimit(browserRateLimitCooldownMs);
+          console.warn(
+            `[chatgpt-web] ChatGPT rate limit activated the account send cooldown until ${new Date(cooldownUntil).toISOString()}`,
+          );
+        }
+        throw error;
+      }
+    })();
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
     if (!mode.localTools) {
-      const browser = finalizeCheckpoint(finalizeContinuum(worker.run({
+      const browser = finalizeCheckpoint(finalizeContinuum(runBrowser({
         traceId,
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
@@ -305,7 +345,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     const token = deferred<string>();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const browser = finalizeCheckpoint(finalizeContinuum(worker.run({
+    const browser = finalizeCheckpoint(finalizeContinuum(runBrowser({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
@@ -495,7 +535,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               ? broker.nextToolBatch(turnToken, toolWaitAbort.signal).then(requests => ({ type: "tools" as const, requests }))
               : undefined;
             const browserOutcome = session.browserOutcome.then(outcome => ({ type: "browser" as const, outcome }));
-            let nextTrace = session.runtime.trace.next(toolWaitAbort.signal).then(event => ({ type: "trace" as const, event }));
+            let nextTrace = session.runtime.trace.wait(toolWaitAbort.signal).then(() => ({ type: "trace" as const }));
             let nextText = session.runtime.text.wait(toolWaitAbort.signal).then(() => ({ type: "text" as const }));
             for (;;) {
               const next = await withAbort(
@@ -508,8 +548,8 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 incoming.abortSignal,
               );
               if (next.type === "trace") {
-                emitNewTrace([next.event]);
-                nextTrace = session.runtime.trace.next(toolWaitAbort.signal).then(event => ({ type: "trace" as const, event }));
+                emitNewTrace(session.runtime.trace.drain());
+                nextTrace = session.runtime.trace.wait(toolWaitAbort.signal).then(() => ({ type: "trace" as const }));
                 continue;
               }
               if (next.type === "text") {

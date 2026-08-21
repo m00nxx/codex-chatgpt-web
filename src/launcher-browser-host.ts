@@ -272,7 +272,13 @@ export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
 export type LauncherTurnActivity =
   | { phase: "start"; traceId: string; helperPid: number; taskKey?: string }
-  | { phase: "heartbeat"; traceId: string; helperPid: number }
+  | {
+      phase: "heartbeat";
+      traceId: string;
+      helperPid: number;
+      continuumMode?: "stateless" | "full" | "delta";
+      continuumReason?: string;
+    }
   | {
       phase: "end";
       traceId: string;

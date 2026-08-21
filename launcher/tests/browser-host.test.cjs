@@ -1102,6 +1102,93 @@ test("five active browser tabs are a hard account-safety limit", () => {
   );
 });
 
+test("a heartbeat publishes the actual Continuum transport without exposing task content", () => {
+  const tab = {
+    id: "tab-continuum-status",
+    traceId: "trace_continuum_status",
+    helperPid: 446,
+    status: "running",
+    message: "ChatGPT is working",
+    lastHeartbeatAt: 1,
+  };
+  const published = [];
+  const logged = [];
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    snapshot: () => ({
+      tabs: [BrowserHost.prototype.tabSnapshot.call({ selectedTabId: tab.id }, tab)],
+    }),
+    publishState: snapshot => published.push(snapshot),
+    logger: { info: (event, detail) => logged.push([event, detail]) },
+  });
+
+  const snapshot = BrowserHost.prototype.heartbeatTurn.call(
+    fixture,
+    tab.traceId,
+    tab.helperPid,
+    "delta",
+    "acknowledged_prefix",
+  );
+
+  assert.equal(tab.message, "ChatGPT Continuum: delta verified");
+  assert.equal(snapshot.tabs[0].continuumMode, "delta");
+  assert.equal(snapshot.tabs[0].continuumReason, "acknowledged_prefix");
+  assert.equal(published.length, 1);
+  assert.deepEqual(logged, [["browser.continuum_transport", {
+    tabId: tab.id,
+    traceId: tab.traceId,
+    mode: "delta",
+    reason: "acknowledged_prefix",
+  }]]);
+});
+
+test("an idle Continuum surface expires without affecting running turns", () => {
+  const closed = [];
+  const events = [];
+  const expired = {
+    id: "tab-expired",
+    traceId: "trace_expired",
+    taskKey: "a".repeat(64),
+    helperPid: 777,
+    status: "ready",
+    lastUsedAt: 1,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        close: () => closed.push("contents"),
+      },
+    },
+  };
+  const running = {
+    id: "tab-running",
+    traceId: "trace_running",
+    helperPid: 778,
+    status: "running",
+    bootstrapReady: true,
+    lastHeartbeatAt: 7_200_001,
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[expired.id, expired], [running.id, running]]),
+    closedTurnOwners: new Map(),
+    selectedTabId: running.id,
+    window: { contentView: { removeChildView: () => closed.push("view") } },
+    syncViewVisibility() {},
+    snapshot: () => ({ tabs: [] }),
+    publishState() {},
+    writeDescriptor() {},
+    logger: { info: (event, detail) => events.push([event, detail]), warn() {} },
+  });
+
+  BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, 7_200_002);
+
+  assert.equal(fixture.turnTabs.has(expired.id), false);
+  assert.equal(fixture.turnTabs.get(running.id), running);
+  assert.deepEqual(closed, ["view", "contents"]);
+  assert.equal(events[0][0], "browser.task_surface_expired");
+  assert.equal(events[0][1].idleMs, 7_200_001);
+});
+
 test("a completed Continuum task retains and re-leases its exact browser surface", async () => {
   const taskKey = "a".repeat(64);
   const throttling = [];

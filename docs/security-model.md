@@ -95,7 +95,11 @@ cache remains private and exists only to implement Codex `previous_response_id` 
 
 ChatGPT 429 responses are non-retryable for the current browser attempt regardless of configured
 retry budget. Optional retries apply only to other explicitly retryable browser failures, use a
-bounded exponential backoff, and default to zero.
+bounded exponential backoff, and default to zero. The runtime spaces account-scoped browser sends
+and persists a bounded `429` cooldown in a digest-namespaced file. A request encountered during the
+cooldown fails locally and is never queued for later submission. Invalid limiter state is archived
+and replaced with a conservative local cooldown; neither limiter state nor its logs contain task
+content or account credentials.
 
 ## Network exposure
 

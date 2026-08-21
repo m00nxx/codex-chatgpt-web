@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -211,5 +211,24 @@ describe("ChatGPT Continuum acknowledged-prefix ledger", () => {
     expect(chatGptContinuumContextDigest(["system"], [user("same", 1)]))
       .toBe(chatGptContinuumContextDigest(["system"], [user("same", 9_999)]));
     expect(withoutSupersededModelSwitchContracts([user("same")])).toHaveLength(1);
+  });
+
+  test("quarantines a corrupt ledger and forces a full-context recovery", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cgw-continuum-corrupt-"));
+    try {
+      const path = join(directory, "continuum.json");
+      writeFileSync(path, "not-json-sensitive-evidence");
+      const store = new ChatGptContinuumStore(path, "provider-corrupt", () => 1_000);
+      const request = parsed("thread-corrupt", "turn-1", [user("recover safely")]);
+      const plan = store.plan(request, request.context.messages);
+
+      expect(plan.mode).toBe("full");
+      expect(plan.reason).toBe("state_recovered");
+      expect(readdirSync(directory).some(name => name.startsWith("continuum.json.corrupt-"))).toBe(true);
+      store.commit(plan, "recovered answer");
+      expect(readFileSync(path, "utf8")).not.toContain("sensitive-evidence");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

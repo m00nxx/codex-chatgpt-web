@@ -5,6 +5,32 @@ All notable changes to ChatGPT Web Continuum are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/). ChatGPT Web remains the real model
 backend: this fork does not replace it with API credits or reduce it to a secondary tool.
 
+## [Unreleased]
+
+### Added
+
+- Added an account-scoped browser send gate with configurable minimum spacing and a persisted
+  cooldown after a real ChatGPT `429` response.
+- Added launcher visibility for the transport actually selected after browser proof: `FULL`,
+  `DELTA`, or `STATELESS`, with a controlled reset reason in local activity.
+- Added fail-closed quarantine and recovery tests for malformed Continuum and rate-limit state.
+
+### Changed
+
+- Expire completed task-bound browser surfaces after two idle hours while leaving running turns
+  untouched; the next task turn safely performs a full synchronization.
+- Preserve queued reasoning and commentary until the adapter drains them, eliminating a completion
+  race that could otherwise omit trace events from a very fast browser turn.
+- Reject implausible future timestamps in persisted limiter state instead of allowing a corrupt
+  file to pin sends indefinitely.
+
+### Safety
+
+- A request observed during a rate-limit cooldown fails locally and is never queued to become an
+  automatic browser send later.
+- Rate-limit and Continuum recovery files contain no prompt, answer, cookie, profile, tunnel, or
+  capability-token data.
+
 ## [2.2.0] - 2026-08-21
 
 ### Added

@@ -22,6 +22,13 @@ async function runCli(args: string[], env: Record<string, string | undefined>) {
   return { exitCode, stdout, stderr };
 }
 
+test("help documents the account send gate and cooldown controls", async () => {
+  const result = await runCli(["--help"], process.env);
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain("--browser-min-send-interval-ms N");
+  expect(result.stdout).toContain("--browser-rate-limit-cooldown-ms N");
+});
+
 test("setup validates the port before performing runtime work", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-"));
   try {

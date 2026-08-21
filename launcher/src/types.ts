@@ -49,6 +49,8 @@ export interface BrowserTabState {
   loading: boolean;
   active: boolean;
   closable: boolean;
+  continuumMode?: "stateless" | "full" | "delta";
+  continuumReason?: string;
 }
 
 export interface LogRecord {

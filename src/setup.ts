@@ -44,6 +44,8 @@ export interface SetupOptions {
   contextMode?: ChatGptContextMode;
   browserTurnRetries?: number;
   browserRetryBackoffMs?: number;
+  browserMinSendIntervalMs?: number;
+  browserRateLimitCooldownMs?: number;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
   acknowledgedUnofficial?: boolean;
@@ -110,6 +112,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     contextMode: before.contextMode,
     browserTurnRetries: before.browserTurnRetries,
     browserRetryBackoffMs: before.browserRetryBackoffMs,
+    browserMinSendIntervalMs: before.browserMinSendIntervalMs,
+    browserRateLimitCooldownMs: before.browserRateLimitCooldownMs,
     controlToken: before.controlToken,
     runtimeCommand: before.runtimeCommand,
     tunnel: before.tunnel,
@@ -132,6 +136,8 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     contextMode: after.contextMode,
     browserTurnRetries: after.browserTurnRetries,
     browserRetryBackoffMs: after.browserRetryBackoffMs,
+    browserMinSendIntervalMs: after.browserMinSendIntervalMs,
+    browserRateLimitCooldownMs: after.browserRateLimitCooldownMs,
     controlToken: after.controlToken,
     runtimeCommand: after.runtimeCommand,
     tunnel: after.tunnel,
@@ -226,6 +232,22 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
       throw new Error("--browser-retry-backoff-ms must be an integer from 250 to 60000");
     }
     config.browserRetryBackoffMs = options.browserRetryBackoffMs;
+  }
+  if (options.browserMinSendIntervalMs !== undefined) {
+    if (!Number.isInteger(options.browserMinSendIntervalMs)
+      || options.browserMinSendIntervalMs < 0
+      || options.browserMinSendIntervalMs > 60_000) {
+      throw new Error("--browser-min-send-interval-ms must be an integer from 0 to 60000");
+    }
+    config.browserMinSendIntervalMs = options.browserMinSendIntervalMs;
+  }
+  if (options.browserRateLimitCooldownMs !== undefined) {
+    if (!Number.isInteger(options.browserRateLimitCooldownMs)
+      || options.browserRateLimitCooldownMs < 30_000
+      || options.browserRateLimitCooldownMs > 3_600_000) {
+      throw new Error("--browser-rate-limit-cooldown-ms must be an integer from 30000 to 3600000");
+    }
+    config.browserRateLimitCooldownMs = options.browserRateLimitCooldownMs;
   }
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
   if (!config.acknowledgedUnofficialAt) {

@@ -182,6 +182,8 @@ function validateConfig(config, descriptorPath, platform = process.platform) {
   const contextMode = config.contextMode ?? "stateful";
   const browserTurnRetries = config.browserTurnRetries ?? 0;
   const browserRetryBackoffMs = config.browserRetryBackoffMs ?? 2_000;
+  const browserMinSendIntervalMs = config.browserMinSendIntervalMs ?? 2_000;
+  const browserRateLimitCooldownMs = config.browserRateLimitCooldownMs ?? 120_000;
   if (config.mode !== "browser-only" && config.mode !== "full") {
     throw new Error("Runtime configuration has an invalid mode");
   }
@@ -237,6 +239,16 @@ function validateConfig(config, descriptorPath, platform = process.platform) {
     || browserRetryBackoffMs < 250
     || browserRetryBackoffMs > 60_000) {
     throw new Error("Runtime configuration has invalid browser retry backoff");
+  }
+  if (!Number.isInteger(browserMinSendIntervalMs)
+    || browserMinSendIntervalMs < 0
+    || browserMinSendIntervalMs > 60_000) {
+    throw new Error("Runtime configuration has invalid browser minimum send interval");
+  }
+  if (!Number.isInteger(browserRateLimitCooldownMs)
+    || browserRateLimitCooldownMs < 30_000
+    || browserRateLimitCooldownMs > 3_600_000) {
+    throw new Error("Runtime configuration has invalid browser rate-limit cooldown");
   }
   if (config.proAvailable && !config.solAvailable) {
     throw new Error("Runtime configuration cannot enable Pro without Sol");

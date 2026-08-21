@@ -864,6 +864,8 @@ describe("ChatGPT outer-native harness v4", () => {
         solAvailable: true,
         proAvailable: true,
         browserTurnRetries: 10,
+        browserMinSendIntervalMs: 0,
+        browserRateLimitCooldownMs: 30_000,
       },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -893,6 +895,76 @@ describe("ChatGPT outer-native harness v4", () => {
           retryable: false,
         });
       }
+      expect(browserStarts).toBe(1);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a ChatGPT 429 blocks a different task through the shared account cooldown", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h4-account-cooldown-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://chatgpt-account-cooldown-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: true,
+        browserRateLimitStatePath: join(tempRoot, `account-cooldown-${Date.now()}.json`),
+        browserMinSendIntervalMs: 0,
+        browserRateLimitCooldownMs: 30_000,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    let browserStarts = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
+      browserStarts += 1;
+      throw new ChatGptWebAdapterError("ChatGPT rate limit. Wait before retrying.", {
+        status: 429,
+        errorType: "rate_limit_error",
+        code: "rate_limit_exceeded",
+        retryable: false,
+      });
+    };
+    try {
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        rawWireRequest(environmentXml),
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "rate_limit_exceeded" });
+
+      const second = rawWireRequest(environmentXml);
+      const raw = second._rawBody as {
+        prompt_cache_key: string;
+        client_metadata: Record<string, unknown>;
+        input: Array<Record<string, unknown>>;
+      };
+      raw.prompt_cache_key = "thread_after_rate_limit";
+      raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+        thread_id: "thread_after_rate_limit",
+        turn_id: "turn_after_rate_limit",
+      });
+      for (const item of raw.input) {
+        item.internal_chat_message_metadata_passthrough = { turn_id: "turn_after_rate_limit" };
+      }
+      const secondEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        second,
+        { headers: new Headers() },
+        event => secondEvents.push(event),
+      );
+
+      expect(secondEvents.at(-1)).toMatchObject({
+        type: "error",
+        status: 429,
+        code: "rate_limit_cooldown",
+        retryable: false,
+      });
       expect(browserStarts).toBe(1);
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;

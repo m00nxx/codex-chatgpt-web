@@ -2,6 +2,18 @@ const { createServer } = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
 
 const MAX_BODY_BYTES = 16 * 1024;
+const CONTINUUM_MODES = new Set(["stateless", "full", "delta"]);
+const CONTINUUM_REASONS = new Set([
+  "stateless",
+  "new_task",
+  "state_recovered",
+  "system_changed",
+  "history_prefix_mismatch",
+  "previous_output_missing",
+  "acknowledged_prefix",
+  "surface_missing",
+  "browser_marker_mismatch",
+]);
 
 function secureTokenMatches(expected, authorization) {
   const prefix = "Bearer ";
@@ -130,7 +142,21 @@ class BrowserControlServer {
         writeJson(response, 200, { ok: true, ...lease });
         return;
       } else if (request.url === "/v1/turn/heartbeat") {
-        host.heartbeatTurn(body.traceId, body.helperPid);
+        if (body.continuumMode !== undefined && !CONTINUUM_MODES.has(body.continuumMode)) {
+          throw new Error("continuumMode is invalid");
+        }
+        if (body.continuumReason !== undefined && !CONTINUUM_REASONS.has(body.continuumReason)) {
+          throw new Error("continuumReason is invalid");
+        }
+        if (body.continuumReason !== undefined && body.continuumMode === undefined) {
+          throw new Error("continuumReason requires continuumMode");
+        }
+        host.heartbeatTurn(
+          body.traceId,
+          body.helperPid,
+          body.continuumMode,
+          body.continuumReason,
+        );
         this.logger.debug?.("browser.turn_heartbeat", { traceId: body.traceId });
         writeJson(response, 200, { ok: true });
         return;

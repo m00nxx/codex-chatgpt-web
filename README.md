@@ -164,7 +164,10 @@ Continuum is enabled by default. Advanced terminal setup can restore the legacy 
 transport with `--context-mode stateless`. Automatic browser re-sends default to zero. They can be
 enabled explicitly with `--browser-turn-retries N`; non-rate-limit retries use exponential backoff
 starting at `--browser-retry-backoff-ms N` (default 2000 ms). ChatGPT rate limits are always
-terminal for the current browser attempt and never trigger another automatic message.
+terminal for the current browser attempt and never trigger another automatic message. New browser
+sends are spaced by `--browser-min-send-interval-ms N` (default 2000 ms). A real ChatGPT `429`
+starts an account-scoped cooldown configured by `--browser-rate-limit-cooldown-ms N` (default
+120000 ms); requests observed during it fail locally and are not queued for later delivery.
 
 ## Operations
 
@@ -190,6 +193,9 @@ capture a screenshot at every checkpoint during an investigation.
 - The local Continuum ledger stores only bounded semantic digests and opaque task keys, not prompt
   text, answers, cookies, capability tokens, or browser profile data. A missing or mismatched
   digest selects a complete reset; it never silently truncates or acknowledges context.
+- The launcher labels each task tab with the transport actually proven by the worker (`FULL`,
+  `DELTA`, or `STATELESS`). Completed task surfaces expire after two idle hours; active turns are
+  never expired by that policy.
 - Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. The browser
   flow is manually exercised end-to-end on macOS and Windows 11; runtime, tests, and native
   packaging are gated on all three operating systems in CI.

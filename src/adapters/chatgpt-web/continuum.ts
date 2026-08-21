@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { atomicWriteFile } from "../../config";
 import type {
   CodexAssistantMessage,
@@ -16,6 +16,7 @@ const sharedStores = new Map<string, ChatGptContinuumStore>();
 
 export type ChatGptContinuumResetReason =
   | "new_task"
+  | "state_recovered"
   | "system_changed"
   | "history_prefix_mismatch"
   | "previous_output_missing";
@@ -168,6 +169,7 @@ function validateStoredTask(value: unknown): StoredContinuumTask {
  */
 export class ChatGptContinuumStore {
   private loaded = false;
+  private recoveredCorruptState = false;
   private readonly tasks = new Map<string, StoredContinuumTask>();
 
   constructor(
@@ -183,6 +185,8 @@ export class ChatGptContinuumStore {
       throw new Error("ChatGPT Continuum requires native Codex thread_id and turn_id metadata");
     }
     this.load();
+    const recoveredCorruptState = this.recoveredCorruptState;
+    this.recoveredCorruptState = false;
     this.prune();
     const taskKey = sha256(`${this.namespace}\0${identity.threadId}`);
     const fullSystem = [...(parsed.context.systemPrompt ?? [])];
@@ -206,6 +210,7 @@ export class ChatGptContinuumStore {
       messageDigests,
     });
 
+    if (recoveredCorruptState) return full("state_recovered");
     if (!previous) return full("new_task");
     if (previous.systemDigest !== systemDigest) return full("system_changed");
     if (previous.inputMessageDigests.length > messageDigests.length
@@ -254,25 +259,40 @@ export class ChatGptContinuumStore {
     if (this.loaded) return;
     this.loaded = true;
     if (!this.path || !existsSync(this.path)) return;
-    const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StoredContinuumFile>;
-    const tasks = record(parsed.tasks);
-    if (parsed.version !== CONTINUUM_STATE_VERSION || !tasks) {
-      throw new Error(`Invalid ChatGPT Continuum state store: ${this.path}`);
+    try {
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StoredContinuumFile>;
+      const tasks = record(parsed.tasks);
+      if (parsed.version !== CONTINUUM_STATE_VERSION || !tasks) {
+        throw new Error("Invalid ChatGPT Continuum state store");
+      }
+      const cutoff = this.now() - CONTINUUM_STATE_TTL_MS;
+      const entries = Object.entries(tasks)
+        .map(([taskKey, value]) => {
+          if (!/^[a-f0-9]{64}$/.test(taskKey)) throw new Error("Invalid persisted ChatGPT Continuum task key");
+          const task = validateStoredTask(value);
+          if (task.marker !== chatGptContinuumMarker(taskKey, task.contextDigest)) {
+            throw new Error("Invalid persisted ChatGPT Continuum task marker binding");
+          }
+          return [taskKey, task] as const;
+        })
+        .filter(([, task]) => task.updatedAt >= cutoff)
+        .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+        .slice(-MAX_CONTINUUM_TASKS);
+      for (const [taskKey, task] of entries) this.tasks.set(taskKey, task);
+    } catch {
+      this.tasks.clear();
+      this.recoveredCorruptState = true;
+      try {
+        renameSync(
+          this.path,
+          `${this.path}.corrupt-${this.now()}-${process.pid}-${randomBytes(4).toString("hex")}`,
+        );
+      } catch {
+        // Preserve inaccessible evidence. The invalid contents remain rejected and this process
+        // still starts from an empty ledger, so no delta can be authorized from corrupt state.
+      }
+      console.warn("[chatgpt-web] invalid Continuum state was rejected; forcing a full-context reset");
     }
-    const cutoff = this.now() - CONTINUUM_STATE_TTL_MS;
-    const entries = Object.entries(tasks)
-      .map(([taskKey, value]) => {
-        if (!/^[a-f0-9]{64}$/.test(taskKey)) throw new Error("Invalid persisted ChatGPT Continuum task key");
-        const task = validateStoredTask(value);
-        if (task.marker !== chatGptContinuumMarker(taskKey, task.contextDigest)) {
-          throw new Error("Invalid persisted ChatGPT Continuum task marker binding");
-        }
-        return [taskKey, task] as const;
-      })
-      .filter(([, task]) => task.updatedAt >= cutoff)
-      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
-      .slice(-MAX_CONTINUUM_TASKS);
-    for (const [taskKey, task] of entries) this.tasks.set(taskKey, task);
   }
 
   private prune(): void {

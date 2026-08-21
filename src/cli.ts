@@ -60,6 +60,8 @@ Setup options:
   --context-mode MODE          Context transport: stateful (default) or stateless
   --browser-turn-retries N     Automatic browser re-sends after failure (default: 0; max: 10)
   --browser-retry-backoff-ms N Exponential retry backoff base (default: 2000; min: 250)
+  --browser-min-send-interval-ms N  Minimum spacing between new browser sends (default: 2000)
+  --browser-rate-limit-cooldown-ms N Cooldown after ChatGPT 429 (default: 120000; min: 30000)
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
 Global:
@@ -161,6 +163,8 @@ async function setupCommand(args: string[]): Promise<void> {
   const contextMode = takeOption(args, "--context-mode");
   const browserTurnRetries = takeOption(args, "--browser-turn-retries");
   const browserRetryBackoffMs = takeOption(args, "--browser-retry-backoff-ms");
+  const browserMinSendIntervalMs = takeOption(args, "--browser-min-send-interval-ms");
+  const browserRateLimitCooldownMs = takeOption(args, "--browser-rate-limit-cooldown-ms");
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
@@ -177,6 +181,8 @@ async function setupCommand(args: string[]): Promise<void> {
   }
   if (browserTurnRetries !== undefined) options.browserTurnRetries = Number(browserTurnRetries);
   if (browserRetryBackoffMs !== undefined) options.browserRetryBackoffMs = Number(browserRetryBackoffMs);
+  if (browserMinSendIntervalMs !== undefined) options.browserMinSendIntervalMs = Number(browserMinSendIntervalMs);
+  if (browserRateLimitCooldownMs !== undefined) options.browserRateLimitCooldownMs = Number(browserRateLimitCooldownMs);
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);

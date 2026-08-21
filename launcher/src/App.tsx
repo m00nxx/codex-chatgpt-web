@@ -732,8 +732,14 @@ function BrowserSurface({
             aria-selected={tab.active}
           >
             <BrandMark small />
-            <span title={tab.traceId ? `${tab.title} · ${tab.traceId}` : tab.title}>
+            <span title={[
+              tab.title,
+              tab.traceId,
+              tab.continuumMode,
+              tab.continuumReason,
+            ].filter(Boolean).join(" · ")}>
               {browserTabTitleFromTitle(tab.title, copy)}
+              {tab.continuumMode ? ` · ${tab.continuumMode.toUpperCase()}` : ""}
             </span>
             {tab.loading ? <i className="tab-spinner" /> : <StateDot state={browserTabTone(tab.status)} />}
             {tab.closable ? (

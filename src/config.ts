@@ -71,6 +71,8 @@ export interface AppConfig {
   contextMode?: ChatGptContextMode;
   browserTurnRetries?: number;
   browserRetryBackoffMs?: number;
+  browserMinSendIntervalMs?: number;
+  browserRateLimitCooldownMs?: number;
   controlToken: string;
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
@@ -165,6 +167,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     contextMode: "stateful",
     browserTurnRetries: 0,
     browserRetryBackoffMs: 2_000,
+    browserMinSendIntervalMs: 2_000,
+    browserRateLimitCooldownMs: 120_000,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
   };
@@ -339,6 +343,18 @@ function parseConfig(value: unknown, path: string): AppConfig {
     || browserRetryBackoffMs > 60_000) {
     throw new Error(`Invalid browserRetryBackoffMs in ${path}; expected an integer from 250 to 60000`);
   }
+  const browserMinSendIntervalMs = parsed.browserMinSendIntervalMs ?? 2_000;
+  if (!Number.isInteger(browserMinSendIntervalMs)
+    || browserMinSendIntervalMs < 0
+    || browserMinSendIntervalMs > 60_000) {
+    throw new Error(`Invalid browserMinSendIntervalMs in ${path}; expected an integer from 0 to 60000`);
+  }
+  const browserRateLimitCooldownMs = parsed.browserRateLimitCooldownMs ?? 120_000;
+  if (!Number.isInteger(browserRateLimitCooldownMs)
+    || browserRateLimitCooldownMs < 30_000
+    || browserRateLimitCooldownMs > 3_600_000) {
+    throw new Error(`Invalid browserRateLimitCooldownMs in ${path}; expected an integer from 30000 to 3600000`);
+  }
   const requiredStrings: Array<keyof AppConfig> = [
     "appName", "chromeExecutablePath", "storageStatePath", "brokerSocketPath", "controlToken",
   ];
@@ -407,6 +423,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
     contextMode,
     browserTurnRetries,
     browserRetryBackoffMs,
+    browserMinSendIntervalMs,
+    browserRateLimitCooldownMs,
   } as AppConfig;
 }
 
@@ -441,9 +459,12 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       threadEnvironmentStatePath: join(getConfigDir(), "runtime", "thread-environments.json"),
       lunaCheckpointStatePath: join(getConfigDir(), "runtime", "luna-checkpoints.json"),
       continuumStatePath: join(getConfigDir(), "runtime", "continuum-state.json"),
+      browserRateLimitStatePath: join(getConfigDir(), "runtime", "browser-rate-limit.json"),
       contextMode: config.contextMode ?? "stateful",
       browserTurnRetries: config.browserTurnRetries ?? 0,
       browserRetryBackoffMs: config.browserRetryBackoffMs ?? 2_000,
+      browserMinSendIntervalMs: config.browserMinSendIntervalMs ?? 2_000,
+      browserRateLimitCooldownMs: config.browserRateLimitCooldownMs ?? 120_000,
       headed: config.headed,
       localToolsEnabled: config.mode === "full",
       solAvailable: config.solAvailable,

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptContinuumMarkerMatches, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptContinuumMarkerMatches, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptContinuumTransportStatus, resolveChatGptToolConfirmation, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -26,6 +26,54 @@ test("Continuum accepts only the exact task-bound digest marker from the retaine
   expect(chatGptContinuumMarkerMatches(`prefix\n${marker}\nsuffix`, marker)).toBeTrue();
   expect(chatGptContinuumMarkerMatches(marker.replace("bbbb", "cccc"), marker)).toBeFalse();
   expect(chatGptContinuumMarkerMatches(marker, "untrusted-marker")).toBeFalse();
+});
+
+test("Continuum reports the actual transport after retained-surface proof", () => {
+  const fullFallback = { text: "full", images: [] };
+  const delta = {
+    taskKey: "a".repeat(64),
+    plannedMode: "delta" as const,
+    reason: "acknowledged_prefix",
+    marker: "next-marker",
+    expectedPreviousMarker: "previous-marker",
+    fullFallback,
+  };
+
+  expect(resolveChatGptContinuumTransportStatus(undefined, false)).toEqual({
+    mode: "stateless",
+    reason: "stateless",
+    resetToFull: false,
+    forceFreshSurface: false,
+  });
+  expect(resolveChatGptContinuumTransportStatus({
+    ...delta,
+    plannedMode: "full",
+    reason: "new_task",
+  }, false)).toEqual({
+    mode: "full",
+    reason: "new_task",
+    resetToFull: false,
+    forceFreshSurface: false,
+  });
+
+  expect(resolveChatGptContinuumTransportStatus(delta, true, true)).toEqual({
+    mode: "delta",
+    reason: "acknowledged_prefix",
+    resetToFull: false,
+    forceFreshSurface: false,
+  });
+  expect(resolveChatGptContinuumTransportStatus(delta, true, false)).toEqual({
+    mode: "full",
+    reason: "browser_marker_mismatch",
+    resetToFull: true,
+    forceFreshSurface: true,
+  });
+  expect(resolveChatGptContinuumTransportStatus(delta, false)).toEqual({
+    mode: "full",
+    reason: "surface_missing",
+    resetToFull: true,
+    forceFreshSurface: false,
+  });
 });
 
 test("browser turns run concurrently up to the five-tab limit", async () => {

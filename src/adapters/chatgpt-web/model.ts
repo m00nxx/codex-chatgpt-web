@@ -1,6 +1,7 @@
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
+  type ChatGptWebBackendModel,
 } from "../../chatgpt-web-models";
 
 export const CHATGPT_WEB_MODEL_ID = CHATGPT_WEB_BACKEND_MODEL;
@@ -13,7 +14,7 @@ export interface ChatGptWebCapabilities {
 }
 
 export interface ChatGptWebModelMode {
-  modelId: string;
+  modelId: ChatGptWebBackendModel;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   displayLabel: "Luna" | "Instant" | "Medium" | "High" | "Extra High" | "Pro";
   uiEffortIndex: 0 | 1 | 2 | 3 | 4 | null;

@@ -24,6 +24,15 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
       const message = JSON.parse(line);
       if (message.type === "shutdown") process.exit(0);
       if (message.type !== "run") return;
+      const continuum = message.turn.prepared.continuum;
+      if (!continuum
+        || continuum.taskKey !== "${"a".repeat(64)}"
+        || continuum.plannedMode !== "delta"
+        || continuum.fullFallback?.text !== "full reset"
+        || message.turn.prepared.trimmedCompactionMessages !== 3) {
+        send({ type: "error", id: message.id, name: "Error", message: "prepared metadata was lost" });
+        return;
+      }
       send({ type: "event", id: message.id, event: "reasoning", text: "Reading project" });
       send({ type: "event", id: message.id, event: "reasoning", text: " files", continuation: true });
       send({ type: "event", id: message.id, event: "text", text: "done" });
@@ -81,7 +90,20 @@ test("Bun daemon streams a prepared browser turn through the persistent Node hel
       modelId: "gpt-5.6-sol",
       reasoning: "high",
       capabilities: { localToolsEnabled: false, solAvailable: true, proAvailable: false },
-      prepare: async () => ({ text: "inspect", images: [], release: () => { released = true; } }),
+      prepare: async () => ({
+        text: "inspect",
+        images: [],
+        trimmedCompactionMessages: 3,
+        continuum: {
+          taskKey: "a".repeat(64),
+          plannedMode: "delta",
+          reason: "acknowledged_prefix",
+          marker: '<codex_continuum_state version="1" />',
+          expectedPreviousMarker: '<codex_continuum_state version="1" previous="true" />',
+          fullFallback: { text: "full reset", images: [] },
+        },
+        release: () => { released = true; },
+      }),
       onReasoningSummary: (text, continuation) => reasoning.push({ text, continuation: continuation === true }),
       onTextDelta: text => deltas.push(text),
       captureLunaCheckpoint: true,

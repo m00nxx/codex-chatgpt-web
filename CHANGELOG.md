@@ -9,6 +9,12 @@ backend: this fork does not replace it with API credits or reduce it to a second
 
 ### Added
 
+- Added an immutable, turn-bound MCP context spool for full tool-capable turns that exceed a
+  measured single-message ChatGPT transport boundary but still fit the underlying model context.
+  One small browser bootstrap reads ordered chunks through `codex_context_next`; it does not send
+  additional browser messages or open retry chats.
+- Added a SHA-256 root digest, per-chunk hash chain, strict cursor ordering, idempotent last-chunk
+  replay, and an explicit final root acknowledgement before task execution can begin.
 - Added an account-scoped browser send gate with configurable minimum spacing and a persisted
   cooldown after a real ChatGPT `429` response.
 - Added launcher visibility for the transport actually selected after browser proof: `FULL`,
@@ -17,6 +23,10 @@ backend: this fork does not replace it with API credits or reduce it to a second
 
 ### Changed
 
+- Preserve the complete compiled Continuum metadata across the launcher browser-helper process,
+  including the task key, delta plan, previous marker, compaction count, and full reset fallback.
+- Added the read-only `codex_context_next` action to the `Codex Native2` public MCP contract. An
+  existing 2.2.0 connector must refresh its action catalog before testing this unreleased source.
 - Expire completed task-bound browser surfaces after two idle hours while leaving running turns
   untouched; the next task turn safely performs a full synchronization.
 - Preserve queued reasoning and commentary until the adapter drains them, eliminating a completion
@@ -26,6 +36,11 @@ backend: this fork does not replace it with API credits or reduce it to a second
 
 ### Safety
 
+- Context spooling is never selected to exceed the model context window, never applies to an
+  unverified delta fallback, and never truncates the compiled prompt. Excessive spool size or
+  overhead leaves the existing explicit context error unchanged.
+- A skipped cursor, digest mismatch, early normal tool, early final answer, cancellation, or broker
+  loss permanently fails that browser attempt closed; no Continuum acknowledgement is committed.
 - A request observed during a rate-limit cooldown fails locally and is never queued to become an
   automatic browser send later.
 - Rate-limit and Continuum recovery files contain no prompt, answer, cookie, profile, tunnel, or

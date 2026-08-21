@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createChatGptContextSpool } from "../src/adapters/chatgpt-web/context-spool";
 import { callTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, isWindowsPipeEndpoint } from "../src/config";
 
@@ -140,6 +141,120 @@ test("turn broker tokens do not expire while their browser turn is still alive",
     await Bun.sleep(5);
     await expect(callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token }))
       .resolves.toMatchObject({ bindingId: expect.any(String) });
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("turn broker delivers and acknowledges context strictly before normal tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-context-spool-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const environment = {
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" as const },
+      tools: [],
+    };
+    const registerSpool = async (traceId: string) => {
+      const token = await broker.register(environment, 60_000, traceId);
+      const spool = createChatGptContextSpool("authoritative context");
+      broker.attachContextSpool(token, spool);
+      const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, {
+        method: "claim",
+        token,
+      });
+      return { token, spool, bindingId: claimed.bindingId };
+    };
+
+    const success = await registerSpool("spooled-success");
+
+    const first = await callTurnBroker<Record<string, unknown>>(socketPath, {
+      method: "context_next",
+      bindingId: success.bindingId,
+      cursor: 0,
+    });
+    const replay = await callTurnBroker<Record<string, unknown>>(socketPath, {
+      method: "context_next",
+      bindingId: success.bindingId,
+      cursor: 0,
+    });
+    expect(first).toEqual(replay);
+    expect(first).toMatchObject({ index: 0, next_cursor: 1, complete: false });
+
+    const complete = await callTurnBroker<Record<string, unknown>>(socketPath, {
+      method: "context_next",
+      bindingId: success.bindingId,
+      cursor: 1,
+      acknowledgedRootDigest: success.spool.rootDigest,
+    });
+    expect(complete).toMatchObject({ complete: true, root_digest: success.spool.rootDigest });
+    expect(() => broker.assertContextSpoolComplete(success.token)).not.toThrow();
+    await expect(callTurnBroker(socketPath, {
+      method: "resolve",
+      bindingId: success.bindingId,
+    })).resolves.toMatchObject({ environment: { cwd: root } });
+
+    const earlyFinal = await registerSpool("spooled-early-final");
+    expect(() => broker.assertContextSpoolComplete(earlyFinal.token)).toThrow("before acknowledging");
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: earlyFinal.bindingId,
+      cursor: 0,
+    })).rejects.toThrow("failed closed");
+
+    const earlyTool = await registerSpool("spooled-early-tool");
+    await expect(callTurnBroker(socketPath, {
+      method: "resolve",
+      bindingId: earlyTool.bindingId,
+    })).rejects.toThrow("before any other Codex Native tool");
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: earlyTool.bindingId,
+      cursor: 0,
+    })).rejects.toThrow("failed closed");
+
+    const outOfOrder = await registerSpool("spooled-out-of-order");
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: outOfOrder.bindingId,
+      cursor: 1,
+    })).rejects.toThrow("out of order");
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: outOfOrder.bindingId,
+      cursor: 0,
+    })).rejects.toThrow("failed closed");
+
+    const wrongDigest = await registerSpool("spooled-wrong-digest");
+    await callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: wrongDigest.bindingId,
+      cursor: 0,
+    });
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: wrongDigest.bindingId,
+      cursor: 1,
+      acknowledgedRootDigest: "f".repeat(64),
+    })).rejects.toThrow("does not match");
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: wrongDigest.bindingId,
+      cursor: 1,
+      acknowledgedRootDigest: wrongDigest.spool.rootDigest,
+    })).rejects.toThrow("failed closed");
+
+    const cancelled = await registerSpool("spooled-cancelled");
+    broker.revoke(cancelled.token);
+    await expect(callTurnBroker(socketPath, {
+      method: "context_next",
+      bindingId: cancelled.bindingId,
+      cursor: 0,
+    })).rejects.toThrow("has already finished");
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });

@@ -9,6 +9,7 @@ import { buildResponseJSON } from "../src/bridge";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { createChatGptContextSpool } from "../src/adapters/chatgpt-web/context-spool";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
@@ -1196,6 +1197,139 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("runs an oversized first turn through the acknowledged context spool", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-spool-adapter-${process.pid}-${Date.now()}`);
+    const statePath = join(tempRoot, `continuum-spool-adapter-${Date.now()}.json`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://context-spool-adapter-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: false,
+        contextMode: "stateful",
+        continuumStatePath: statePath,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const oversized = " ".repeat(220_000);
+    const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4nGP4z8DwHwwZGP6DAQBJyAn3FGMynQAAAABJRU5ErkJggg==";
+    let reconstructed = "";
+    let expectedRootDigest = "";
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      try {
+        expect(prepared.text).toContain('<codex_context_spool version="1">');
+        expect(prepared.text.length).toBeLessThan(10_000);
+        expect(prepared.continuum?.plannedMode).toBe("full");
+        expect(prepared.text).toContain(prepared.continuum!.marker);
+        expect(prepared.images).toEqual([{ ref: "codex-input-image-1", imageUrl, detail: "high" }]);
+        const token = prepared.text.match(/turn_token: (turn_[A-Za-z0-9_-]+)/)?.[1];
+        const rootDigest = prepared.text.match(/root_digest: ([a-f0-9]{64})/)?.[1];
+        const totalChunks = Number(prepared.text.match(/total_chunks: (\d+)/)?.[1]);
+        if (!token || !rootDigest || !Number.isInteger(totalChunks)) {
+          throw new Error("context spool bootstrap metadata is missing");
+        }
+        expectedRootDigest = rootDigest;
+        const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, {
+          method: "claim",
+          token,
+        });
+        for (let cursor = 0; cursor < totalChunks; cursor += 1) {
+          const chunk = await callTurnBroker<{
+            chunk: string;
+            index: number;
+            next_cursor: number;
+            complete: false;
+          }>(socketPath, {
+            method: "context_next",
+            bindingId: claimed.bindingId,
+            cursor,
+          });
+          expect(chunk.index).toBe(cursor);
+          expect(chunk.next_cursor).toBe(cursor + 1);
+          reconstructed += chunk.chunk;
+        }
+        await expect(callTurnBroker(socketPath, {
+          method: "context_next",
+          bindingId: claimed.bindingId,
+          cursor: totalChunks,
+          acknowledgedRootDigest: rootDigest,
+        })).resolves.toMatchObject({ complete: true, root_digest: rootDigest });
+        const answer = "Spooled context accepted";
+        turn.onTextDelta(answer);
+        return answer;
+      } finally {
+        prepared.release();
+      }
+    };
+
+    const request = rawWireRequest(environmentXml);
+    request.options.reasoning = "low";
+    request.context.messages.at(-1)!.content = [
+      { type: "text", text: oversized },
+      { type: "image", imageUrl, detail: "high" },
+    ];
+    const events: AdapterEvent[] = [];
+    try {
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(reconstructed).toContain(`<codex_context_json>\n`);
+      expect(reconstructed).toContain(oversized);
+      expect(reconstructed).toContain('"attachment_ref":"codex-input-image-1"');
+      expect(reconstructed).not.toContain(imageUrl);
+      expect(createHash("sha256").update(reconstructed).digest("hex"))
+        .toBe(expectedRootDigest);
+      expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
+  test("rejects an early browser final before context acknowledgement", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-spool-early-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://context-spool-early-${Date.now()}`,
+      chatgptWeb: {
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: false,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      expect(prepared.text).toContain('<codex_context_spool version="1">');
+      turn.onTextDelta("untrusted early answer");
+      prepared.release();
+      return "untrusted early answer";
+    };
+    const request = rawWireRequest(environmentXml);
+    request.options.reasoning = "low";
+    request.context.messages.at(-1)!.content = " ".repeat(220_000);
+    const events: AdapterEvent[] = [];
+    try {
+      await expect(createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => events.push(event),
+      )).rejects.toThrow("before acknowledging the complete context spool");
+      expect(events.some(event => event.type === "done")).toBe(false);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
   test("keeps only the newest complete Codex model-switch contract", () => {
     const history = [
       { role: "developer" as const, content: "<model_switch>old contract</model_switch>", timestamp: 1 },
@@ -2061,6 +2195,7 @@ describe("ChatGPT outer-native harness v4", () => {
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
+        "codex_context_next",
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",
@@ -2078,7 +2213,7 @@ describe("ChatGPT outer-native harness v4", () => {
       // ChatGPT caches the complete tools/list contract under a connector identity.
       // An intentional hash change therefore requires an explicit connector refresh or identity migration.
       expect(createHash("sha256").update(canonicalJson(publicConnectorAbi)).digest("hex"))
-        .toBe("5cb59b378c7d1939e260a2b4a60f58e22da31208fe09c2cc17a2cf31eb5ff3ad");
+        .toBe("c45a9c9e50872588d8978f975154cfe1c37d850f3502a6afeac94e80937e5064");
       for (const tool of listed.tools) {
         const properties = tool.inputSchema.properties as Record<string, unknown>;
         expect(properties.turn_token).toEqual({ type: "string", minLength: 20, maxLength: 256 });
@@ -2090,6 +2225,12 @@ describe("ChatGPT outer-native harness v4", () => {
         destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
+      });
+      expect(listed.tools.find(tool => tool.name === "codex_context_next")?.annotations).toMatchObject({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
       });
       expect(listed.tools.find(tool => tool.name === "codex_write_stdin")?.annotations).toMatchObject({
         readOnlyHint: false,
@@ -2121,6 +2262,53 @@ describe("ChatGPT outer-native harness v4", () => {
         idempotentHint: false,
         openWorldHint: true,
       });
+
+      const spoolToken = await broker.register(gatewayOnlyEnvironment, 60_000, "mcp-spool");
+      const spool = createChatGptContextSpool("immutable MCP context");
+      broker.attachContextSpool(spoolToken, spool);
+      const firstContext = await call("codex_context_next", {
+        turn_token: spoolToken,
+        cursor: 0,
+      });
+      expect(firstContext.structuredContent).toBeUndefined();
+      const firstContextContent = firstContext.content as Array<{ type: string; text: string }>;
+      expect(JSON.parse(firstContextContent[0]!.text)).toMatchObject({
+        chunk: "immutable MCP context",
+        index: 0,
+        next_cursor: 1,
+        complete: false,
+      });
+      const contextComplete = await call("codex_context_next", {
+        turn_token: spoolToken,
+        cursor: 1,
+        acknowledged_root_digest: spool.rootDigest,
+      });
+      const contextCompleteContent = contextComplete.content as Array<{ type: string; text: string }>;
+      expect(JSON.parse(contextCompleteContent[0]!.text)).toMatchObject({
+        root_digest: spool.rootDigest,
+        complete: true,
+      });
+      const readyInventory = await call("codex_tool_inventory", {
+        turn_token: spoolToken,
+        limit: 1,
+      });
+      expect(readyInventory.isError).not.toBe(true);
+      broker.revoke(spoolToken);
+
+      const earlyToolToken = await broker.register(gatewayOnlyEnvironment, 60_000, "mcp-spool-early-tool");
+      broker.attachContextSpool(earlyToolToken, createChatGptContextSpool("blocked MCP context"));
+      const earlyInventory = await call("codex_tool_inventory", {
+        turn_token: earlyToolToken,
+      });
+      expect(earlyInventory.isError).toBe(true);
+      expect(JSON.stringify(earlyInventory.content)).toContain("before any other Codex Native tool");
+      const afterViolation = await call("codex_context_next", {
+        turn_token: earlyToolToken,
+        cursor: 0,
+      });
+      expect(afterViolation.isError).toBe(true);
+      expect(JSON.stringify(afterViolation.content)).toContain("failed closed");
+      broker.revoke(earlyToolToken);
 
       const firstExec = call("codex_exec", {
         turn_token: token,

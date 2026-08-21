@@ -6,6 +6,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker, type BrowserTurn } from "./browser-worker";
+import { selectChatGptContextSpool } from "./context-spool";
 import { sharedChatGptContinuumStore, type ChatGptContinuumPlan } from "./continuum";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -345,7 +346,12 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     const token = deferred<string>();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const browser = finalizeCheckpoint(finalizeContinuum(runBrowser({
+    const finalizeContextSpool = (browser: Promise<string>): Promise<string> => browser.then(answer => {
+      if (!activeToken) throw new Error("ChatGPT context spool lost its active turn token");
+      broker.assertContextSpoolComplete(activeToken);
+      return answer;
+    });
+    const browser = finalizeCheckpoint(finalizeContinuum(finalizeContextSpool(runBrowser({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
@@ -366,7 +372,24 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             turnToken,
             { captureLunaCheckpoint, ...(continuumPlan ? { continuumPlan } : {}) },
           );
-          return { ...compiled, release: () => {} };
+          const selection = selectChatGptContextSpool(
+            compiled,
+            turnToken,
+            mode.modelId,
+            mode.effort,
+            turnCapabilities,
+          );
+          if (selection.spool) {
+            broker.attachContextSpool(turnToken, selection.spool);
+            console.info(
+              `[chatgpt-web] context spool selected chunks=${selection.spool.chunks.length}`
+              + ` aggregateEstimatedInputTokens=${selection.aggregateInputTokens ?? "unknown"}`,
+            );
+          } else if (selection.reason !== "not_needed"
+            && selection.reason !== "delta_requires_browser_verification") {
+            console.info(`[chatgpt-web] context spool not selected reason=${selection.reason}`);
+          }
+          return { ...selection.prepared, release: () => {} };
         } catch (error) {
           broker.revoke(turnToken);
           throw error;
@@ -380,7 +403,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         captureLunaCheckpoint: true,
         onLunaCheckpoint: captureCheckpoint,
       } : {}),
-    })));
+    }))));
     void browser.catch(error => {
       if (!tokenSettled) {
         tokenSettled = true;

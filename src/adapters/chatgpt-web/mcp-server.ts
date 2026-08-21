@@ -3,6 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import { namespacedToolName, type CodexTool } from "../../types";
+import {
+  MAX_CHATGPT_CONTEXT_SPOOL_CHUNKS,
+  type ChatGptContextSpoolPayload,
+} from "./context-spool";
 import type { ChatGptTurnEnvironment } from "./environment";
 import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 
@@ -50,6 +54,12 @@ function result(value: Record<string, unknown>, isError = false) {
     structuredContent: value,
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function contextSpoolResult(value: ChatGptContextSpoolPayload) {
+  // The chunk is intentionally present only once. `structuredContent` would duplicate a large
+  // immutable payload in clients that expose both MCP result representations to the model.
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
 function wireName(tool: CodexTool): string {
@@ -143,7 +153,7 @@ function execCommandGatewayProgram(
 }
 
 export async function runChatGptMcpServer(options: { brokerSocketPath: string }): Promise<void> {
-  const server = new McpServer({ name: "codex-native", version: "4.0.0" });
+  const server = new McpServer({ name: "codex-native", version: "5.0.0" });
 
   const claimTurn = async (
     toolName: string,
@@ -151,7 +161,16 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     extra: Parameters<typeof requestScopeSummary>[0],
   ): Promise<ClaimedTurn> => {
     console.error(`[chatgpt-web-mcp] ${toolName} scope=${requestScopeSummary(extra)}`);
-    return await callTurnBroker<ClaimedTurn>(options.brokerSocketPath, { method: "claim", token: turnToken });
+    const claimed = await callTurnBroker<ClaimedTurn>(
+      options.brokerSocketPath,
+      { method: "claim", token: turnToken },
+    );
+    const resolved = await callTurnBroker<{ environment: ClaimedTurn["environment"] }>(
+      options.brokerSocketPath,
+      { method: "resolve", bindingId: claimed.bindingId },
+      invocationTimeout(claimed.environment),
+    );
+    return { bindingId: claimed.bindingId, environment: resolved.environment };
   };
 
   const invoke = async (
@@ -185,6 +204,40 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       input: execGatewayProgram(nestedToolName, freeform, payload),
     });
   };
+
+  server.registerTool(
+    "codex_context_next",
+    {
+      title: "Read the next immutable Codex context chunk",
+      description: "Read one ordered, turn-bound context spool chunk. Use only when the browser bootstrap explicitly requires it; follow next_cursor exactly and acknowledge root_digest at the final cursor.",
+      inputSchema: {
+        turn_token: turnTokenSchema,
+        cursor: z.number().int().min(0).max(MAX_CHATGPT_CONTEXT_SPOOL_CHUNKS),
+        acknowledged_root_digest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ turn_token, cursor, acknowledged_root_digest }, extra) => {
+      console.error(`[chatgpt-web-mcp] codex_context_next scope=${requestScopeSummary(extra)}`);
+      const claimed = await callTurnBroker<ClaimedTurn>(
+        options.brokerSocketPath,
+        { method: "claim", token: turn_token },
+      );
+      const response = await callTurnBroker<ChatGptContextSpoolPayload>(
+        options.brokerSocketPath,
+        {
+          method: "context_next",
+          bindingId: claimed.bindingId,
+          cursor,
+          ...(acknowledged_root_digest
+            ? { acknowledgedRootDigest: acknowledged_root_digest }
+            : {}),
+        },
+        invocationTimeout(claimed.environment),
+      );
+      return contextSpoolResult(response);
+    },
+  );
 
   server.registerTool(
     "codex_exec",

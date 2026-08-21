@@ -21,7 +21,10 @@
 Free and Go accounts get **ChatGPT Web — Luna** in Codex's native model picker. Accounts that
 expose the reasoning selector keep **Instant**, **Medium**, **High**, **Extra High**, and **Pro** as
 their subscription allows. ChatGPT Web Continuum binds each Codex task to one Temporary Chat: the
-first turn sends the required compiled context, later turns send only the locally proven delta.
+first turn transfers the required compiled context, later turns send only the locally proven delta.
+When a full tool-capable turn exceeds only ChatGPT's one-message boundary, the unreleased context
+spool can transfer that same immutable prompt through ordered read-only MCP results inside the one
+browser response; it never expands the model context window.
 Images, visible reasoning, tool activity, and Markdown still stream back into the same Codex task.
 
 <p align="center">
@@ -153,6 +156,11 @@ not expose a public IP, open an inbound port, or require router forwarding.
    Codex harness still enforces its sandbox and approvals.
 6. Run **Verify runtime**. It selects **Codex Native2** exactly. If only **Codex Native** is found,
    verification fails with an explicit migration error instead of accepting the legacy connector.
+
+> [!NOTE]
+> Unreleased source builds add the read-only `codex_context_next` action. If **Codex Native2** was
+> created for 2.2.0, refresh or recreate that same exact connector before testing oversized full
+> turns so ChatGPT receives the new action schema. Do not change the connector name or permissions.
 
 Write/modify actions also require the ChatGPT workspace and its administrator policy to permit
 them. See

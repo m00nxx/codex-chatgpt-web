@@ -3,6 +3,12 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { isWindowsPipeEndpoint } from "../../config";
+import {
+  chatGptContextSpoolChunkPayload,
+  chatGptContextSpoolCompletePayload,
+  type ChatGptContextSpool,
+  type ChatGptContextSpoolPayload,
+} from "./context-spool";
 import type { ChatGptTurnEnvironment } from "./environment";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
@@ -37,6 +43,13 @@ interface ToolWaiter {
   onAbort?: () => void;
 }
 
+interface TurnContextSpoolState {
+  spool: ChatGptContextSpool;
+  nextCursor: number;
+  acknowledged: boolean;
+  failure?: string;
+}
+
 interface TurnChannel {
   traceId: string;
   environment: PendingTurn;
@@ -45,17 +58,20 @@ interface TurnChannel {
   invocations: Map<string, PendingInvocation>;
   waiters: Set<ToolWaiter>;
   batchTimer?: ReturnType<typeof setTimeout>;
+  contextSpool?: TurnContextSpoolState;
 }
 
 interface BrokerRequest {
   id: string;
-  method: "claim" | "resolve" | "release" | "invoke";
+  method: "claim" | "resolve" | "release" | "invoke" | "context_next";
   token?: string;
   bindingId?: string;
   wireName?: string;
   freeform?: boolean;
   arguments?: Record<string, unknown>;
   input?: string;
+  cursor?: number;
+  acknowledgedRootDigest?: string;
 }
 
 interface BrokerResponse {
@@ -168,6 +184,38 @@ export class TurnBroker {
         ? { expiresAt: channel.environment.expiresAt }
         : {}),
     };
+  }
+
+  attachContextSpool(token: string, spool: ChatGptContextSpool): void {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new Error("turn token is invalid or expired");
+    if (channel.bindingId) throw new Error("ChatGPT context spool must be attached before the turn is claimed");
+    if (channel.contextSpool) throw new Error("ChatGPT context spool is already attached");
+    if (!/^[a-f0-9]{64}$/.test(spool.rootDigest) || spool.chunks.length === 0) {
+      throw new Error("ChatGPT context spool is invalid");
+    }
+    const immutableSpool: ChatGptContextSpool = Object.freeze({
+      version: 1,
+      rootDigest: spool.rootDigest,
+      chunks: Object.freeze(spool.chunks.map(chunk => Object.freeze({ ...chunk }))) as unknown as ChatGptContextSpool["chunks"],
+    });
+    channel.contextSpool = { spool: immutableSpool, nextCursor: 0, acknowledged: false };
+  }
+
+  assertContextSpoolComplete(token: string): void {
+    this.prune();
+    const channel = this.channels.get(token);
+    if (!channel) throw new Error("turn token is invalid or expired");
+    if (channel.contextSpool?.failure) {
+      throw new Error(`ChatGPT context spool failed closed: ${channel.contextSpool.failure}`);
+    }
+    if (channel.contextSpool && !channel.contextSpool.acknowledged) {
+      channel.contextSpool.failure = "the browser returned a final answer before context acknowledgement";
+      throw new Error(
+        "ChatGPT returned a final answer before acknowledging the complete context spool",
+      );
+    }
   }
 
   async nextToolBatch(token: string, signal?: AbortSignal): Promise<BrokerToolRequest[]> {
@@ -368,7 +416,11 @@ export class TurnBroker {
     if (!request || typeof request !== "object" || typeof request.id !== "string" || request.id.length === 0 || request.id.length > 256) {
       throw new Error("turn broker request id is invalid");
     }
-    if (request.method !== "claim" && request.method !== "resolve" && request.method !== "release" && request.method !== "invoke") {
+    if (request.method !== "claim"
+      && request.method !== "resolve"
+      && request.method !== "release"
+      && request.method !== "invoke"
+      && request.method !== "context_next") {
       throw new Error("turn broker method is invalid");
     }
   }
@@ -421,6 +473,30 @@ export class TurnBroker {
       this.revoke(binding.token);
       return { released: true };
     }
+    if (request.method === "context_next") {
+      const cursor = request.cursor;
+      if (!Number.isInteger(cursor) || (cursor as number) < 0) {
+        this.failContextSpool(
+          binding.channel,
+          "context cursor was not a non-negative integer",
+          "ChatGPT context spool cursor must be a non-negative integer",
+        );
+      }
+      if (request.acknowledgedRootDigest !== undefined
+        && !/^[a-f0-9]{64}$/.test(request.acknowledgedRootDigest)) {
+        this.failContextSpool(
+          binding.channel,
+          "the acknowledged root digest was malformed",
+          "ChatGPT context spool acknowledged root digest is invalid",
+        );
+      }
+      return this.nextContextSpool(
+        binding.channel,
+        cursor as number,
+        request.acknowledgedRootDigest,
+      );
+    }
+    this.assertContextToolsReady(binding.channel);
     if (request.method === "resolve") return { environment: binding.channel.environment };
 
     const wireName = request.wireName?.trim();
@@ -440,6 +516,81 @@ export class TurnBroker {
       );
       this.scheduleToolWaiters(binding.channel);
     });
+  }
+
+  private assertContextToolsReady(channel: TurnChannel): void {
+    if (channel.contextSpool?.failure) {
+      throw new Error(`ChatGPT context spool failed closed: ${channel.contextSpool.failure}`);
+    }
+    if (channel.contextSpool && !channel.contextSpool.acknowledged) {
+      this.failContextSpool(
+        channel,
+        "another Codex Native tool was requested before context acknowledgement",
+        "The complete ChatGPT context spool must be acknowledged before any other Codex Native tool",
+      );
+    }
+  }
+
+  private failContextSpool(channel: TurnChannel, failure: string, message: string): never {
+    if (channel.contextSpool) channel.contextSpool.failure ??= failure;
+    throw new Error(message);
+  }
+
+  private nextContextSpool(
+    channel: TurnChannel,
+    cursor: number,
+    acknowledgedRootDigest?: string,
+  ): ChatGptContextSpoolPayload {
+    const state = channel.contextSpool;
+    if (!state) throw new Error("ChatGPT context spool is not enabled for this turn");
+    if (state.failure) throw new Error(`ChatGPT context spool failed closed: ${state.failure}`);
+    const total = state.spool.chunks.length;
+
+    if (cursor === total) {
+      if (state.nextCursor !== total) {
+        this.failContextSpool(
+          channel,
+          `cursor ${cursor} was requested while ${state.nextCursor} was required`,
+          `ChatGPT context spool cursor is out of order: expected ${state.nextCursor}, received ${cursor}`,
+        );
+      }
+      if (acknowledgedRootDigest !== state.spool.rootDigest) {
+        this.failContextSpool(
+          channel,
+          "the completion root digest did not match",
+          "ChatGPT context spool completion root digest does not match",
+        );
+      }
+      state.acknowledged = true;
+      console.info(
+        `[chatgpt-web] broker trace=${channel.traceId} context spool acknowledged chunks=${total}`,
+      );
+      return chatGptContextSpoolCompletePayload(state.spool);
+    }
+
+    if (acknowledgedRootDigest !== undefined) {
+      this.failContextSpool(
+        channel,
+        `the root digest was acknowledged before final cursor ${total}`,
+        "ChatGPT context spool root digest may only be acknowledged at the final cursor",
+      );
+    }
+    if (cursor === state.nextCursor) {
+      const payload = chatGptContextSpoolChunkPayload(state.spool, cursor);
+      state.nextCursor += 1;
+      console.info(
+        `[chatgpt-web] broker trace=${channel.traceId} context spool delivered chunk=${cursor + 1}/${total}`,
+      );
+      return payload;
+    }
+    if (cursor === state.nextCursor - 1) {
+      return chatGptContextSpoolChunkPayload(state.spool, cursor);
+    }
+    this.failContextSpool(
+      channel,
+      `cursor ${cursor} was requested while ${state.nextCursor} was required`,
+      `ChatGPT context spool cursor is out of order: expected ${state.nextCursor}, received ${cursor}`,
+    );
   }
 
   private takeQueued(channel: TurnChannel): BrokerToolRequest[] {

@@ -137,6 +137,7 @@ export class LauncherBrowserHelperClient {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     const prepared = await turn.prepare();
     try {
+      const { release: _release, ...serializedPrepared } = prepared;
       await this.ensureChild();
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       return await new Promise<string>((resolveResult, rejectResult) => {
@@ -186,7 +187,7 @@ export class LauncherBrowserHelperClient {
             modelId: turn.modelId,
             reasoning: turn.reasoning,
             capabilities: turn.capabilities,
-            prepared: { text: prepared.text, images: prepared.images } satisfies CompiledChatGptWebPrompt,
+            prepared: serializedPrepared satisfies CompiledChatGptWebPrompt,
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
           },
         }).catch(error => this.finishWithError(turn.traceId, error instanceof Error ? error : new Error(String(error))));

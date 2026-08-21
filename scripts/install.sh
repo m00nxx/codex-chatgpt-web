@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="${CODEX_CHATGPT_WEB_REPOSITORY:-naakto14/codex-chatgpt-web}"
-VERSION="${CODEX_CHATGPT_WEB_VERSION:-2.1.12-naakto.1}"
+REPOSITORY="${CODEX_CHATGPT_WEB_REPOSITORY:-m00nxx/codex-chatgpt-web}"
+VERSION="${CODEX_CHATGPT_WEB_VERSION:-2.2.0}"
 BIN_DIR="${CODEX_CHATGPT_WEB_BIN_DIR:-$HOME/.local/bin}"
 LIB_DIR="${CODEX_CHATGPT_WEB_LIB_DIR:-$HOME/.local/lib/codex-chatgpt-web}"
 DOC_DIR="${CODEX_CHATGPT_WEB_DOC_DIR:-$HOME/.local/share/doc/codex-chatgpt-web}"

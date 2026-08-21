@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/m00nxx/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/m00nxx/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
   <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
@@ -73,13 +73,13 @@ Codex 任务的工具。
 **macOS 或 Linux**
 
 ```bash
-curl -fsSL https://github.com/naakto14/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/m00nxx/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/naakto14/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/m00nxx/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 然后在应用中完成三项检查：
@@ -99,7 +99,7 @@ Chrome/Chromium、系统级 Node/Bun，也不会由本项目另行下载浏览�
 **从源码运行**
 
 ```bash
-git clone https://github.com/naakto14/codex-chatgpt-web.git && \
+git clone https://github.com/m00nxx/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```

@@ -57,6 +57,9 @@ Setup options:
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
+  --context-mode MODE          Context transport: stateful (default) or stateless
+  --browser-turn-retries N     Automatic browser re-sends after failure (default: 0; max: 10)
+  --browser-retry-backoff-ms N Exponential retry backoff base (default: 2000; min: 250)
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
 Global:
@@ -155,6 +158,9 @@ async function setupCommand(args: string[]): Promise<void> {
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
+  const contextMode = takeOption(args, "--context-mode");
+  const browserTurnRetries = takeOption(args, "--browser-turn-retries");
+  const browserRetryBackoffMs = takeOption(args, "--browser-retry-backoff-ms");
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
@@ -163,6 +169,14 @@ async function setupCommand(args: string[]): Promise<void> {
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
+  if (contextMode) {
+    if (contextMode !== "stateful" && contextMode !== "stateless") {
+      throw new Error("--context-mode must be stateful or stateless");
+    }
+    options.contextMode = contextMode;
+  }
+  if (browserTurnRetries !== undefined) options.browserTurnRetries = Number(browserTurnRetries);
+  if (browserRetryBackoffMs !== undefined) options.browserRetryBackoffMs = Number(browserRetryBackoffMs);
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);

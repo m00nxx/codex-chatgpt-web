@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptContinuumMarkerMatches, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -19,6 +19,13 @@ test("browser turn orchestration retains owned prompt insertion and semantic sub
   expect(runBrowserTurn).toContain("await this.waitForSubmissionAccepted(");
   expect(runBrowserTurn).not.toContain("userTurns.nth(initialUserTurnCount).waitFor");
   expect(workerSource).not.toMatch(/\bclipboard\b|pbcopy|pbpaste/i);
+});
+
+test("Continuum accepts only the exact task-bound digest marker from the retained transcript", () => {
+  const marker = '<codex_continuum_state version="1" task="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" context_digest="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" />';
+  expect(chatGptContinuumMarkerMatches(`prefix\n${marker}\nsuffix`, marker)).toBeTrue();
+  expect(chatGptContinuumMarkerMatches(marker.replace("bbbb", "cccc"), marker)).toBeFalse();
+  expect(chatGptContinuumMarkerMatches(marker, "untrusted-marker")).toBeFalse();
 });
 
 test("browser turns run concurrently up to the five-tab limit", async () => {
@@ -171,6 +178,62 @@ test("active composer resolution waits for exactly one visible editor", async ()
   }).activeComposer;
 
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
+});
+
+test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
+  // This reproduces a live macOS compaction failure where a 16k prompt prefix retained the same
+  // UTF-16 length but Lexical exposed alternating NBSP/ASCII spaces inside a long indentation run.
+  const expected = `prefix C\\n${" ".repeat(24)}suffix`;
+  const observed = `prefix C\\n${"\u00A0 ".repeat(12)}suffix`;
+
+  expect(observed.length).toBe(expected.length);
+  expect(observed).not.toBe(expected);
+
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    attachedPromptText: async () => observed,
+  }) as ChatGptBrowserWorker;
+
+  const promptTextEquivalent = (ChatGptBrowserWorker.prototype as unknown as {
+    promptTextEquivalent(expected: string, observed: string): boolean;
+  }).promptTextEquivalent;
+
+  expect(promptTextEquivalent.call(worker, expected, observed)).toBeTrue();
+
+  // The allowance is intentionally directional and restricted to repeated ASCII-space runs.
+  expect(promptTextEquivalent.call(worker, "a  b", "a\u00A0 b")).toBeTrue();
+  expect(promptTextEquivalent.call(worker, "a b", "a\u00A0b")).toBeFalse();
+  expect(promptTextEquivalent.call(worker, "a\u00A0b", "a b")).toBeFalse();
+
+  // Other whitespace and same-length text mutations must remain fail closed.
+  expect(promptTextEquivalent.call(worker, "a b", "a\tb")).toBeFalse();
+  expect(promptTextEquivalent.call(worker, "a\nb", "a b")).toBeFalse();
+  expect(promptTextEquivalent.call(worker, "abc", "abd")).toBeFalse();
+  expect(promptTextEquivalent.call(worker, "abc", "ab")).toBeFalse();
+
+  const waitForPromptChunkAttached = (ChatGptBrowserWorker.prototype as unknown as {
+    waitForPromptChunkAttached(
+      page: Page,
+      expected: string,
+      abortSignal?: AbortSignal,
+    ): Promise<void>;
+  }).waitForPromptChunkAttached;
+
+  const assertPromptAttached = (ChatGptBrowserWorker.prototype as unknown as {
+    assertPromptAttached(
+      page: Page,
+      prompt: string,
+      abortSignal?: AbortSignal,
+    ): Promise<void>;
+  }).assertPromptAttached;
+
+  // Exercise both verification stages so this is not only a unit test of the comparator.
+  await expect(
+    waitForPromptChunkAttached.call(worker, {} as Page, expected),
+  ).resolves.toBeUndefined();
+
+  await expect(
+    assertPromptAttached.call(worker, {} as Page, expected),
+  ).resolves.toBeUndefined();
 });
 
 test("large read-only context is inserted as contiguous bounded edits before exact verification", async () => {
@@ -1010,7 +1073,7 @@ test("the known ChatGPT rate-limit dialog is acknowledged and returns a structur
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -1026,7 +1089,7 @@ test("the Japanese ChatGPT rate-limit dialog is acknowledged and returns a struc
     status: 429,
     errorType: "rate_limit_error",
     code: "rate_limit_exceeded",
-    retryable: true,
+    retryable: false,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });

@@ -6,9 +6,10 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
+import { sharedChatGptContinuumStore, type ChatGptContinuumPlan } from "./continuum";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
-import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
+import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "./prompt";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
@@ -55,6 +56,22 @@ function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
       },
     );
   });
+}
+
+async function waitForBrowserRetryBackoff(
+  delayMs: number,
+  signal: AbortSignal | undefined,
+  emit: (event: AdapterEvent) => void,
+): Promise<void> {
+  const deadline = Date.now() + delayMs;
+  while (Date.now() < deadline) {
+    emit({ type: "heartbeat" });
+    const remaining = deadline - Date.now();
+    await withAbort(
+      new Promise<void>(resolveWait => setTimeout(resolveWait, Math.min(1_000, remaining))),
+      signal,
+    );
+  }
 }
 
 function structuredContent(text: string): unknown | undefined {
@@ -171,6 +188,9 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     baseUrl: provider.baseUrl,
     chatgptWeb: provider.chatgptWeb ?? {},
   })).digest("hex");
+  const continuumEnabled = provider.chatgptWeb?.contextMode !== "stateless";
+  const browserTurnRetries = provider.chatgptWeb?.browserTurnRetries ?? 0;
+  const browserRetryBackoffMs = provider.chatgptWeb?.browserRetryBackoffMs ?? 2_000;
   const environmentStore = new ChatGptThreadEnvironmentStore(
     provider.chatgptWeb?.threadEnvironmentStatePath
       ? resolve(expandUserPath(provider.chatgptWeb.threadEnvironmentStatePath))
@@ -180,6 +200,13 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     provider.chatgptWeb?.lunaCheckpointStatePath
       ? resolve(expandUserPath(provider.chatgptWeb.lunaCheckpointStatePath))
       : undefined,
+  );
+  const continuumStatePath = provider.chatgptWeb?.continuumStatePath
+    ? resolve(expandUserPath(provider.chatgptWeb.continuumStatePath))
+    : undefined;
+  const continuumStore = sharedChatGptContinuumStore(
+    continuumStatePath,
+    executionNamespace,
   );
   const currentUsageInput = (parsed: CodexParsedRequest): CodexParsedRequest => (
     parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && !parsed._compactionRequest
@@ -201,6 +228,20 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     const checkpointInput = captureLunaCheckpoint
       ? lunaCheckpointStore.apply(parsed)
       : { parsed, applied: false };
+    const continuumPlan: ChatGptContinuumPlan | undefined = continuumEnabled
+      && !parsed._compactionRequest
+      && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
+      ? continuumStore.plan(
+        checkpointInput.parsed,
+        withoutSupersededModelSwitchContracts(checkpointInput.parsed.context.messages),
+      )
+      : undefined;
+    if (continuumPlan) {
+      console.info(
+        `[chatgpt-web] Continuum mode=${continuumPlan.mode} reason=${continuumPlan.reason}`
+        + ` deltaMessages=${continuumPlan.messages.length} fullMessages=${continuumPlan.fullMessages.length}`,
+      );
+    }
     if (captureLunaCheckpoint) {
       console.info(
         `[chatgpt-web] Luna rolling checkpoint applied=${checkpointInput.applied}${checkpointInput.reason ? ` reason=${checkpointInput.reason}` : ""}`,
@@ -221,11 +262,15 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       if (capturedCheckpoint) lunaCheckpointStore.commit(parsed, capturedCheckpoint, answer);
       return answer;
     });
+    const finalizeContinuum = (browser: Promise<string>): Promise<string> => browser.then(answer => {
+      if (continuumPlan) continuumStore.commit(continuumPlan, answer);
+      return answer;
+    });
     const browserAbort = new AbortController();
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
     if (!mode.localTools) {
-      const browser = finalizeCheckpoint(worker.run({
+      const browser = finalizeCheckpoint(finalizeContinuum(worker.run({
         traceId,
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
@@ -235,7 +280,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             checkpointInput.parsed,
             turnCapabilities,
             undefined,
-            { captureLunaCheckpoint },
+            { captureLunaCheckpoint, ...(continuumPlan ? { continuumPlan } : {}) },
           ),
           release: () => {},
         }),
@@ -247,7 +292,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           captureLunaCheckpoint: true,
           onLunaCheckpoint: captureCheckpoint,
         } : {}),
-      }));
+      })));
       return {
         mode: "read-only",
         browser,
@@ -260,7 +305,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     const token = deferred<string>();
     let tokenSettled = false;
     let activeToken: string | undefined;
-    const browser = finalizeCheckpoint(worker.run({
+    const browser = finalizeCheckpoint(finalizeContinuum(worker.run({
       traceId,
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
@@ -279,7 +324,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             checkpointInput.parsed,
             turnCapabilities,
             turnToken,
-            { captureLunaCheckpoint },
+            { captureLunaCheckpoint, ...(continuumPlan ? { continuumPlan } : {}) },
           );
           return { ...compiled, release: () => {} };
         } catch (error) {
@@ -295,7 +340,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         captureLunaCheckpoint: true,
         onLunaCheckpoint: captureCheckpoint,
       } : {}),
-    }));
+    })));
     void browser.catch(error => {
       if (!tokenSettled) {
         tokenSettled = true;
@@ -330,7 +375,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         : configuredCapabilities;
       const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
       const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
-      const exhaustedRetry = chatGptWebTurnRetryPolicy.exhaustedError(retryKey);
+      const exhaustedRetry = chatGptWebTurnRetryPolicy.exhaustedError(retryKey, browserTurnRetries);
       if (exhaustedRetry) {
         emit({
           type: "error",
@@ -341,6 +386,11 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           retryable: false,
         });
         return;
+      }
+      const retryDelayMs = chatGptWebTurnRetryPolicy.retryDelayMs(retryKey, browserTurnRetries);
+      if (retryDelayMs > 0) {
+        console.info(`[chatgpt-web] waiting ${retryDelayMs}ms before an explicitly configured browser retry`);
+        await waitForBrowserRetryBackoff(retryDelayMs, incoming.abortSignal, emit);
       }
       let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
       if (mode.localTools) {
@@ -504,7 +554,12 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         });
       } catch (error) {
         const handledError = error instanceof ChatGptWebAdapterError && error.retryable
-          ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, error)
+          ? chatGptWebTurnRetryPolicy.recordRetryableFailure(
+            retryKey,
+            error,
+            browserTurnRetries,
+            browserRetryBackoffMs,
+          )
           : error;
         if (!(error instanceof ChatGptWebAdapterError && error.retryable)) {
           chatGptWebTurnRetryPolicy.clear(retryKey);

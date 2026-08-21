@@ -252,6 +252,14 @@ export interface CodexProviderConfig {
     threadEnvironmentStatePath?: string;
     /** Persisted exact-parent rolling checkpoints used only by Free/Luna turns. */
     lunaCheckpointStatePath?: string;
+    /** Digest-only acknowledged-prefix ledger for task-bound ChatGPT Continuum conversations. */
+    continuumStatePath?: string;
+    /** Stateful task conversation transport, or the legacy fresh-chat full-envelope transport. */
+    contextMode?: "stateful" | "stateless";
+    /** Automatic browser sends allowed after the initial attempt. Defaults to zero. */
+    browserTurnRetries?: number;
+    /** Exponential backoff base for explicitly enabled browser retries. */
+    browserRetryBackoffMs?: number;
     /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
     /** Keep the single controlled browser visible. */

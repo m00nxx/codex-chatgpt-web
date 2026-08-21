@@ -123,13 +123,13 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
     } catch (error) {
       throw new ChatGptWebAdapterError(
         `ChatGPT rate-limit dialog is open, but its acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`,
-        { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
+        { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false },
       );
     }
   }
   throw new ChatGptWebAdapterError(
     "ChatGPT rate limit: too many requests are being made too quickly. Wait before retrying.",
-    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: true },
+    { status: 429, errorType: "rate_limit_error", code: "rate_limit_exceeded", retryable: false },
   );
 }
 
@@ -346,6 +346,11 @@ export function chatGptSubmissionEvidence(state: {
   if (state.assistantTurnCount > state.initialAssistantTurnCount) return "assistant_turn";
   if (state.generationRunning) return "generation_running";
   return undefined;
+}
+
+export function chatGptContinuumMarkerMatches(transcriptText: string, expectedMarker: string): boolean {
+  return expectedMarker.startsWith("<codex_continuum_state ")
+    && transcriptText.includes(expectedMarker);
 }
 
 export class ChatGptCompletionTracker {
@@ -757,6 +762,58 @@ export class ChatGptBrowserWorker {
 
   private constructor(private readonly config: ResolvedBrowserConfig) {}
 
+  /**
+   * Lexical/contenteditable may preserve runs of ASCII spaces by exposing some of them as NBSP
+   * through DOM textContent. Treat that DOM-only representation as equivalent only when the
+   * expected U+0020 belongs to a multi-space run. Single spaces, tabs, newlines, intentional
+   * expected NBSP characters, and every other mutation remain exact and fail closed.
+   */
+  private promptCodeUnitEquivalent(
+    expected: string,
+    observed: string,
+    index: number,
+  ): boolean {
+    const expectedUnit = expected[index];
+    const observedUnit = observed[index];
+
+    if (expectedUnit === observedUnit) return true;
+    if (expectedUnit !== " " || observedUnit !== "\u00A0") return false;
+
+    return expected[index - 1] === " " || expected[index + 1] === " ";
+  }
+
+  private promptTextEquivalent(
+    expected: string,
+    observed: string,
+  ): boolean {
+    if (expected.length !== observed.length) return false;
+
+    for (let index = 0; index < expected.length; index += 1) {
+      if (!this.promptCodeUnitEquivalent(expected, observed, index)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private promptEquivalentPrefixLength(
+    expected: string,
+    observed: string,
+  ): number {
+    const length = Math.min(expected.length, observed.length);
+
+    let index = 0;
+    while (
+      index < length
+      && this.promptCodeUnitEquivalent(expected, observed, index)
+    ) {
+      index += 1;
+    }
+
+    return index;
+  }
+
   run(turn: BrowserTurn): Promise<string> {
     if (this.activeRuns.has(turn.traceId)) {
       return Promise.reject(new Error(`Duplicate ChatGPT web browser turn: ${turn.traceId}`));
@@ -1091,12 +1148,18 @@ export class ChatGptBrowserWorker {
   private async prepareTemporaryChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    forceFresh = false,
+    preserveTranscript = false,
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
-    if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
+    if (forceFresh && page.url() !== "about:blank") {
+      await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await captureDiagnostic?.("continuum-reset-navigation-started");
+    }
+    if (!preserveTranscript && (forceFresh || page.url() !== CHATGPT_TEMPORARY_CHAT_URL)) {
       await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
@@ -1115,6 +1178,14 @@ export class ChatGptBrowserWorker {
     await assertTemporaryChatPage(page);
     await captureDiagnostic?.("session-verified");
     return composer;
+  }
+
+  private async retainedContinuumMarkerMatches(page: Page, expectedMarker: string): Promise<boolean> {
+    const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR);
+    const count = await userTurns.count();
+    if (count < 1) return false;
+    const transcriptText = await userTurns.nth(count - 1).innerText().catch(() => "");
+    return chatGptContinuumMarkerMatches(transcriptText, expectedMarker);
   }
 
   private async waitForSubmissionAccepted(
@@ -1175,12 +1246,11 @@ export class ChatGptBrowserWorker {
       throwIfPromptAttachmentAborted(abortSignal);
       observed = await this.attachedPromptText(page);
       throwIfPromptAttachmentAborted(abortSignal);
-      if (observed === prompt) return;
+      if (this.promptTextEquivalent(prompt, observed)) return;
       await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
     }
     throwIfPromptAttachmentAborted(abortSignal);
-    let commonPrefix = 0;
-    while (commonPrefix < prompt.length && prompt[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    const commonPrefix = this.promptEquivalentPrefixLength(prompt, observed);
     throw new Error(
       `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
     );
@@ -1441,12 +1511,11 @@ export class ChatGptBrowserWorker {
       throwIfPromptAttachmentAborted(abortSignal);
       observed = await this.attachedPromptText(page);
       throwIfPromptAttachmentAborted(abortSignal);
-      if (observed === expected) return;
+      if (this.promptTextEquivalent(expected, observed)) return;
       await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
     } while (Date.now() < deadline);
     throwIfPromptAttachmentAborted(abortSignal);
-    let commonPrefix = 0;
-    while (commonPrefix < expected.length && expected[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    const commonPrefix = this.promptEquivalentPrefixLength(expected, observed);
     throw new Error(
       `ChatGPT composer did not commit a complete prompt insertion chunk`
       + ` (expectedChars=${expected.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
@@ -1772,15 +1841,27 @@ export class ChatGptBrowserWorker {
 
   private async runExclusive(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn);
+    const prepared = await turn.prepare();
+    if (this.config.browserHost !== "launcher") return this.runBrowserTurn(turn, undefined, undefined, prepared, false);
 
-    const lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
-      phase: "start",
-      traceId: turn.traceId,
-      helperPid: process.pid,
-    });
+    let preparedOwnedByRun = false;
+    let lease: Awaited<ReturnType<typeof notifyLauncherTurn>>;
+    try {
+      lease = await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+        phase: "start",
+        traceId: turn.traceId,
+        helperPid: process.pid,
+        ...(prepared.continuum ? { taskKey: prepared.continuum.taskKey } : {}),
+      });
+    } catch (error) {
+      prepared.release();
+      throw error;
+    }
     const surfaceId = lease.surfaceId;
-    if (!surfaceId) throw new Error("Launcher did not lease a browser tab for the ChatGPT turn");
+    if (!surfaceId) {
+      prepared.release();
+      throw new Error("Launcher did not lease a browser tab for the ChatGPT turn");
+    }
     let terminal: "completed" | "failed" | "aborted" = "completed";
     let terminalMessage: string | undefined;
     let originalError: unknown;
@@ -1808,7 +1889,8 @@ export class ChatGptBrowserWorker {
     try {
       heartbeatTimer = setInterval(sendHeartbeat, LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS);
       heartbeatTimer.unref?.();
-      return await this.runBrowserTurn(turn, surfaceId);
+      preparedOwnedByRun = true;
+      return await this.runBrowserTurn(turn, surfaceId, undefined, prepared, lease.resumed === true);
     } catch (error) {
       originalError = error;
       terminal = error instanceof DOMException && error.name === "AbortError" ? "aborted" : "failed";
@@ -1816,6 +1898,7 @@ export class ChatGptBrowserWorker {
       throw error;
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (!preparedOwnedByRun) prepared.release();
       try {
         await notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
           phase: "end",
@@ -1837,6 +1920,8 @@ export class ChatGptBrowserWorker {
     turn: BrowserTurn,
     launcherSurfaceId?: string,
     maintenancePage?: Page,
+    precompiled?: CompiledChatGptWebPrompt & { release: () => void },
+    launcherSurfaceResumed = false,
   ): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if ((turn.captureLunaCheckpoint === true) !== (turn.onLunaCheckpoint !== undefined)) {
@@ -1846,23 +1931,17 @@ export class ChatGptBrowserWorker {
       throw new Error("Private rolling checkpoint capture is valid only for ChatGPT Luna");
     }
     const requestedMode = resolveChatGptWebModelMode(turn.modelId, turn.reasoning, turn.capabilities);
-    const prepared = await turn.prepare();
+    const originalPrepared = precompiled ?? await turn.prepare();
+    let prepared = originalPrepared;
+    let continuumTransport: "stateless" | "full" | "delta" = originalPrepared.continuum
+      ? originalPrepared.continuum.plannedMode
+      : "stateless";
     const diagnostics = new ChatGptBrowserDiagnostics(turn.traceId);
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
     let diagnosticPage: Page | undefined;
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-      const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
-      const estimatedMessageTokens = estimateCompiledChatGptWebMessageTokens(prepared, turn.modelId);
-      assertChatGptWebInputWithinLimits(
-        estimatedInputTokens,
-        estimatedMessageTokens,
-        turn.modelId,
-        requestedMode.effort,
-        turn.capabilities,
-        prepared.text.length,
-      );
       const deadline = this.config.turnTimeoutMs === undefined
         ? undefined
         : Date.now() + this.config.turnTimeoutMs;
@@ -1892,8 +1971,40 @@ export class ChatGptBrowserWorker {
       if (!maintenancePage && !launcherSurfaceId) managedPage = page;
       diagnosticPage = page;
       await diagnostics.capture(page, "browser-page-acquired");
+      let forceFreshContinuumSurface = false;
+      if (originalPrepared.continuum) {
+        const continuum = originalPrepared.continuum;
+        if (continuum.plannedMode === "delta") {
+          if (!continuum.fullFallback || !continuum.expectedPreviousMarker) {
+            throw new Error("ChatGPT Continuum delta is missing its full reset fallback or prefix marker");
+          }
+          const markerMatches = launcherSurfaceResumed
+            && await this.retainedContinuumMarkerMatches(page, continuum.expectedPreviousMarker);
+          if (!markerMatches) {
+            prepared = { ...continuum.fullFallback, continuum, release: originalPrepared.release };
+            continuumTransport = "full";
+            forceFreshContinuumSurface = launcherSurfaceResumed;
+            console.warn(
+              `[chatgpt-web] Continuum reset selected for ${turn.traceId}`
+              + ` (surfaceResumed=${launcherSurfaceResumed}, prefixDigestVerified=${markerMatches})`,
+            );
+          }
+        } else if (launcherSurfaceResumed) {
+          forceFreshContinuumSurface = true;
+        }
+      }
+      const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
+      const estimatedMessageTokens = estimateCompiledChatGptWebMessageTokens(prepared, turn.modelId);
+      assertChatGptWebInputWithinLimits(
+        estimatedInputTokens,
+        estimatedMessageTokens,
+        turn.modelId,
+        requestedMode.effort,
+        turn.capabilities,
+        prepared.text.length,
+      );
       console.info(
-        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=inline, promptChars=${prepared.text.length}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
+        `[chatgpt-web] browser turn ${turn.traceId} opened (transport=${continuumTransport}, promptChars=${prepared.text.length}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length}, compactionTrimmedMessages=${prepared.trimmedCompactionMessages ?? 0})`,
       );
       await this.runStage(
         turn.traceId,
@@ -1902,6 +2013,8 @@ export class ChatGptBrowserWorker {
         () => this.prepareTemporaryChatSurface(
           page,
           checkpoint => diagnostics.capture(page, checkpoint),
+          forceFreshContinuumSurface,
+          continuumTransport === "delta",
         ),
       );
       let mode: ChatGptWebModelMode;
@@ -2119,7 +2232,7 @@ export class ChatGptBrowserWorker {
       }
       throw error;
     } finally {
-      prepared.release();
+      originalPrepared.release();
       if (turnConnection) {
         await turnConnection.close().catch(error => {
           console.error(

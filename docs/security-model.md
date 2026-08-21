@@ -80,13 +80,22 @@ external browser.
 
 ### Cross-turn data leakage
 
-Browser turns use at most five independent task-bound tabs in one private login partition. Every
-outer Codex task owns a fresh Temporary Chat document and an exact launcher surface lease; chats are
-never reused across tasks. Closing a running tab destroys its page and terminates that turn. The
-five-tab limit bounds parallel account traffic. Tool calls remain in the same ChatGPT response. The
-bounded local continuation cache is private, expires, and exists only to implement Codex
-`previous_response_id` replay. ChatGPT Web context compaction remains inside the active browser
-response; the bridge does not fabricate or install a Codex history checkpoint.
+Browser turns use at most five independent task-bound tabs in one private login partition. A task
+may reuse only the surface with its opaque hash-derived task key. The next delta is authorized only
+when the current Codex semantic history extends the stored acknowledged prefix, contains the proven
+prior final answer, and the retained browser transcript contains the exact prior digest marker.
+Forks use a different key. A missing surface, restart, compaction replacement, eviction, or mismatch
+forces a complete fresh-chat synchronization; failed and aborted surfaces are destroyed.
+
+The persisted Continuum file contains only hashes, timestamps, and opaque task keys. It never stores
+prompt text, answers, images, cookies, connector capabilities, tunnel credentials, or browser state.
+Closing a running tab destroys its page and terminates that turn. The five-tab limit bounds parallel
+account traffic. Tool calls remain in the same ChatGPT response. The bounded local continuation
+cache remains private and exists only to implement Codex `previous_response_id` replay.
+
+ChatGPT 429 responses are non-retryable for the current browser attempt regardless of configured
+retry budget. Optional retries apply only to other explicitly retryable browser failures, use a
+bounded exponential backoff, and default to zero.
 
 ## Network exposure
 

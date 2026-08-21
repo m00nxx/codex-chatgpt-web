@@ -80,3 +80,45 @@ test("browser control server authenticates and owns turn visibility", async () =
     await server.close();
   }
 });
+
+test("browser control server binds an opaque Continuum task key to its retained surface", async () => {
+  const calls = [];
+  const taskKey = "c".repeat(64);
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {} },
+    getBrowserHost: () => ({
+      beginTurn: (...args) => {
+        calls.push(args);
+        return {
+          surfaceId: "launcher_surface_id_0123456789AB",
+          tabId: "tab-continuum",
+          resumed: true,
+        };
+      },
+    }),
+    getPreferences: () => ({ showBrowserDuringTurns: false }),
+  }).start();
+  const descriptor = server.descriptor();
+  try {
+    const response = await fetch(`${descriptor.endpoint}/v1/turn/start`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        phase: "start",
+        traceId: "continuum123",
+        helperPid: process.pid,
+        taskKey,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      ok: true,
+      surfaceId: "launcher_surface_id_0123456789AB",
+      tabId: "tab-continuum",
+      resumed: true,
+    });
+    assert.deepEqual(calls, [["continuum123", false, process.pid, taskKey]]);
+  } finally {
+    await server.close();
+  }
+});

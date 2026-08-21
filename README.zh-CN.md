@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/m00nxx/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/m00nxx/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
   <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
@@ -20,8 +20,9 @@
 
 Free 和 Go 账户会在 Codex 原生模型选择器中看到 **ChatGPT Web — Luna**。具有推理选择器的
 账户仍会按订阅权限看到 **Instant**、**Medium**、**High**、**Extra High** 和 **Pro**。
-桥接程序会把当前编译后的 Codex 任务上下文发送到一个全新的 ChatGPT 临时聊天，附加图片，
-并将可见的推理过程、工具活动和 Markdown 流式传回同一个 Codex 任务。
+ChatGPT Web Continuum 会把每个 Codex 任务绑定到一个临时聊天：第一轮发送必要的完整上下文，
+后续轮次只发送经过本地验证、尚未确认的增量。图片、可见推理、工具活动和 Markdown 仍会流式
+传回同一个 Codex 任务。
 
 <p align="center">
   <img src="assets/demo.gif" alt="ChatGPT Web 实时轮次正在使用原生 Codex harness" width="960">
@@ -34,7 +35,7 @@ Codex task ──Responses + SSE──▶ codex-chatgpt-web ──embedded brows
 ```
 
 Codex 会保留原生任务、上下文生命周期、界面和工具 harness。本地 Responses 桥接程序只会将
-所选模型的轮次转发到全新的 ChatGPT 临时聊天；在完整模式下，MCP 会把 ChatGPT 连接回同一个
+所选模型转发到任务绑定的 ChatGPT 临时聊天；在完整模式下，MCP 会把 ChatGPT 连接回同一个
 Codex 任务的工具。
 
 ## 亮点
@@ -45,10 +46,10 @@ Codex 任务的工具。
   对 ChatGPT 账户产生过多并行流量。
 - **ChatGPT 就是所选模型。** 它作为 Codex 原生模型运行，而不是由另一个宿主模型调用的工具。
   原有的模型选择器、任务生命周期、流式输出、追踪和工具界面保持不变。
-- **本地优先的任务会话。** Codex 仍然是电脑上任务历史的真实来源。每个浏览器轮次都会从一个
-  全新的 ChatGPT 临时聊天开始，并接收当前编译后的上下文。达到实测浏览器上限时会触发压缩，
-  Luna 则通过自适应滚动检查点携带已完成的状态。浏览器聊天不会在任务之间复用，也不会加入普通
-  ChatGPT 历史记录。
+- **本地优先的任务会话。** Codex 仍然是电脑上任务历史的真实来源。Continuum 为每个任务保留
+  一个临时聊天，同时验证本地已确认前缀和浏览器摘要标记，然后只发送有序增量。恢复、分叉、
+  压缩、重启、淘汰或摘要不匹配都会触发受控的完整上下文重置。Luna 继续使用自适应滚动检查点。
+  浏览器聊天不会在任务之间复用，也不会加入普通 ChatGPT 历史记录。
 - **通过 MCP 使用完整 Codex harness。** 在完整模式下，Instant 到 Extra High 可以通过 MCP
   使用当前 Codex 任务的文件系统、shell、图片、审批以及已配置的工具和应用。调用及其真实结果
   会留在同一个浏览器响应中，不会被模拟成文本。
@@ -72,13 +73,13 @@ Codex 任务的工具。
 **macOS 或 Linux**
 
 ```bash
-curl -fsSL https://github.com/naakto14/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+curl -fsSL https://github.com/m00nxx/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/naakto14/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+irm https://github.com/m00nxx/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
 ```
 
 然后在应用中完成三项检查：
@@ -98,7 +99,7 @@ Chrome/Chromium、系统级 Node/Bun，也不会由本项目另行下载浏览�
 **从源码运行**
 
 ```bash
-git clone https://github.com/naakto14/codex-chatgpt-web.git && \
+git clone https://github.com/m00nxx/codex-chatgpt-web.git && \
 cd codex-chatgpt-web && \
 bun run app
 ```
@@ -146,6 +147,11 @@ bun run app
 除非显式启用 `--auto-approve-tool-calls`，否则意外的审批提示会直接失败；该选项只会点击
 **Allow once**，绝不会授予永久权限。
 
+Continuum 默认启用。高级终端设置可用 `--context-mode stateless` 恢复旧的全新聊天传输。
+浏览器自动重发默认值为 0；只有显式设置 `--browser-turn-retries N` 才会启用，非限流错误会从
+`--browser-retry-backoff-ms N`（默认 2000 毫秒）开始指数退避。ChatGPT 限流始终终止当前
+浏览器尝试，绝不会自动发送另一条消息。
+
 ## 日常操作
 
 在 **活动** 页面查看结构化本地日志，在 **设置 → 运行诊断** 中执行端到端健康检查。如果已停止的
@@ -161,6 +167,8 @@ bun run app
   [#76](https://github.com/miuuyy/codex-chatgpt-web/issues/76) 中。
 - 浏览器状态是敏感的登录凭据，loopback 监听器也可被同一本地用户运行的进程访问。切勿共享
   启动器 profile，并仅在可信工作站上使用。
+- Continuum 本地账本只保存有界语义摘要和不透明任务键，不保存提示文本、回答、Cookie、能力令牌
+  或浏览器 profile。摘要缺失或不匹配会触发完整重置，不会静默截断或确认上下文。
 - 发布包目前支持 macOS 13+（arm64/x64）、Windows x64 和 Linux x64。浏览器流程已在 macOS
   和 Windows 11 上完成手动端到端测试；核心运行时、测试和原生打包会在 CI 中对三种操作系统
   进行检查。

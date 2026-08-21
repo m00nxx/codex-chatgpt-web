@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
-import type { AppConfig, RuntimeMode } from "./config";
+import type { AppConfig, ChatGptContextMode, RuntimeMode } from "./config";
 import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
@@ -41,6 +41,9 @@ export interface SetupOptions {
   appName?: string;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
+  contextMode?: ChatGptContextMode;
+  browserTurnRetries?: number;
+  browserRetryBackoffMs?: number;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
   acknowledgedUnofficial?: boolean;
@@ -104,6 +107,9 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     solAvailable: before.solAvailable,
     proAvailable: before.proAvailable,
     autoApproveToolCalls: before.autoApproveToolCalls,
+    contextMode: before.contextMode,
+    browserTurnRetries: before.browserTurnRetries,
+    browserRetryBackoffMs: before.browserRetryBackoffMs,
     controlToken: before.controlToken,
     runtimeCommand: before.runtimeCommand,
     tunnel: before.tunnel,
@@ -123,6 +129,9 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     solAvailable: after.solAvailable,
     proAvailable: after.proAvailable,
     autoApproveToolCalls: after.autoApproveToolCalls,
+    contextMode: after.contextMode,
+    browserTurnRetries: after.browserTurnRetries,
+    browserRetryBackoffMs: after.browserRetryBackoffMs,
     controlToken: after.controlToken,
     runtimeCommand: after.runtimeCommand,
     tunnel: after.tunnel,
@@ -203,6 +212,21 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
   }
   config.appName = resolveSetupConnectorName(existing?.appName, options.appName);
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
+  if (options.contextMode !== undefined) config.contextMode = options.contextMode;
+  if (options.browserTurnRetries !== undefined) {
+    if (!Number.isInteger(options.browserTurnRetries) || options.browserTurnRetries < 0 || options.browserTurnRetries > 10) {
+      throw new Error("--browser-turn-retries must be an integer from 0 to 10");
+    }
+    config.browserTurnRetries = options.browserTurnRetries;
+  }
+  if (options.browserRetryBackoffMs !== undefined) {
+    if (!Number.isInteger(options.browserRetryBackoffMs)
+      || options.browserRetryBackoffMs < 250
+      || options.browserRetryBackoffMs > 60_000) {
+      throw new Error("--browser-retry-backoff-ms must be an integer from 250 to 60000");
+    }
+    config.browserRetryBackoffMs = options.browserRetryBackoffMs;
+  }
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
   if (!config.acknowledgedUnofficialAt) {
     throw new Error("Setup requires explicit acknowledgement that this is unofficial browser automation. Pass --acknowledge-unofficial.");

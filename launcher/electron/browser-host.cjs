@@ -262,11 +262,22 @@ class BrowserHost {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  createTurnTab(traceId, helperPid) {
+  createTurnTab(traceId, helperPid, taskKey) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS) {
-      throw new Error(
-        `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
-      );
+      const evictable = [...this.turnTabs.values()]
+        .filter((candidate) => candidate.status !== "running")
+        .sort((left, right) => (left.lastUsedAt ?? 0) - (right.lastUsedAt ?? 0))[0];
+      if (!evictable) {
+        throw new Error(
+          `ChatGPT Web already has ${MAX_BROWSER_TABS} active browser tabs; finish one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
+        );
+      }
+      this.logger.info("browser.task_surface_evicted", {
+        tabId: evictable.id,
+        traceId: evictable.traceId,
+        reason: "least_recently_used",
+      });
+      this.removeTurnTab(evictable, false);
     }
     const id = randomBytes(12).toString("base64url");
     const surfaceId = randomBytes(24).toString("base64url");
@@ -287,6 +298,7 @@ class BrowserHost {
       id,
       surfaceId,
       traceId,
+      taskKey: taskKey || null,
       helperPid,
       view,
       status: "running",
@@ -299,6 +311,7 @@ class BrowserHost {
       bootstrapReady: false,
       bootstrapDeadlineAt: Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS,
       lastHeartbeatAt: Date.now(),
+      lastUsedAt: Date.now(),
     };
     this.turnTabs.set(id, tab);
     this.window.contentView.addChildView(view);
@@ -1019,15 +1032,17 @@ class BrowserHost {
     return this.snapshot();
   }
 
-  beginTurn(traceId, reveal, helperPid) {
+  beginTurn(traceId, reveal, helperPid, taskKey) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
-    const existing = [...this.turnTabs.values()].find((tab) => tab.traceId === traceId);
+    const existing = [...this.turnTabs.values()].find((tab) => (
+      taskKey ? tab.taskKey === taskKey : tab.traceId === traceId
+    ));
     if (existing) {
-      if (existing.status === "running" && existing.helperPid !== helperPid) {
+      if (existing.status === "running") {
         if (processRunning(existing.helperPid)) {
-          throw new Error(`ChatGPT browser turn ${traceId} is owned by another helper process`);
+          throw new Error(`ChatGPT browser task surface is already running turn ${existing.traceId}`);
         }
         this.logger.warn("browser.stale_turn_owner_replaced", {
           tabId: existing.id,
@@ -1038,12 +1053,14 @@ class BrowserHost {
         });
       }
       existing.helperPid = helperPid;
+      existing.traceId = traceId;
       existing.status = "running";
       existing.loading = true;
       existing.message = "ChatGPT is working";
       existing.bootstrapReady = false;
       existing.bootstrapDeadlineAt = Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS;
       existing.lastHeartbeatAt = Date.now();
+      existing.lastUsedAt = Date.now();
       if (!existing.view.webContents.isDestroyed()) {
         existing.view.webContents.setBackgroundThrottling(false);
       }
@@ -1053,15 +1070,23 @@ class BrowserHost {
       this.publishState?.(this.snapshot());
       this.writeDescriptor();
       this.logger.info("browser.tab_reused", { tabId: existing.id, traceId });
-      return { surfaceId: existing.surfaceId, tabId: existing.id };
+      return {
+        surfaceId: existing.surfaceId,
+        tabId: existing.id,
+        ...(taskKey ? { resumed: true } : {}),
+      };
     }
-    const tab = this.createTurnTab(traceId, helperPid);
+    const tab = this.createTurnTab(traceId, helperPid, taskKey);
     this.selectedTabId = tab.id;
     if (reveal) this.show();
     else this.syncViewVisibility();
     this.publishState?.(this.snapshot());
     this.logger.info("browser.tab_created", { tabId: tab.id, traceId, tabCount: this.turnTabs.size });
-    return { surfaceId: tab.surfaceId, tabId: tab.id };
+    return {
+      surfaceId: tab.surfaceId,
+      tabId: tab.id,
+      ...(taskKey ? { resumed: false } : {}),
+    };
   }
 
   async endTurn(traceId, helperPid, status, hideAfterTurn, message) {
@@ -1082,17 +1107,21 @@ class BrowserHost {
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
     tab.message = status === "completed" ? "Task completed" : message || `ChatGPT turn ${status}`;
     tab.loading = false;
+    tab.lastUsedAt = Date.now();
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.setBackgroundThrottling(true);
     if (status === "completed") {
       this.logger.info("browser.tab_completed", { tabId: tab.id, traceId });
     }
-    // A browser tab represents an active Codex turn, not durable task history. Retaining terminal
-    // tabs leaked one slot per response/compaction until the five-tab safety limit made later
-    // turns fail. The result already lives in Codex; release the browser document on every
-    // terminal path while leaving other concurrently running tabs untouched.
-    this.removeTurnTab(tab, false);
+    // Continuum surfaces remain bound to their opaque task key after a proven completion. Failed,
+    // aborted, and legacy stateless turns are always destroyed so a later request cannot append to
+    // a transcript whose terminal state was never acknowledged.
+    if (status !== "completed" || !tab.taskKey) this.removeTurnTab(tab, false);
     if (hideAfterTurn && !this.activeTraceId) this.hide();
-    this.logger.info("browser.tab_released", { tabId: tab.id, traceId, status: tab.status });
+    this.logger.info(tab.taskKey && status === "completed" ? "browser.task_surface_retained" : "browser.tab_released", {
+      tabId: tab.id,
+      traceId,
+      status: tab.status,
+    });
   }
 
   async returnToIdle() {

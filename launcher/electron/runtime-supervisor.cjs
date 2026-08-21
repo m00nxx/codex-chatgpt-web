@@ -179,6 +179,9 @@ function managedTunnelConnectArgs(config, invocation) {
 function validateConfig(config, descriptorPath, platform = process.platform) {
   if (!config || config.version !== 3) throw new Error("Runtime configuration is missing or unsupported");
   if (config.solAvailable === undefined) config = { ...config, solAvailable: true };
+  const contextMode = config.contextMode ?? "stateful";
+  const browserTurnRetries = config.browserTurnRetries ?? 0;
+  const browserRetryBackoffMs = config.browserRetryBackoffMs ?? 2_000;
   if (config.mode !== "browser-only" && config.mode !== "full") {
     throw new Error("Runtime configuration has an invalid mode");
   }
@@ -221,6 +224,19 @@ function validateConfig(config, descriptorPath, platform = process.platform) {
     if (typeof config[key] !== "boolean") {
       throw new Error(`Runtime configuration has an invalid ${key}`);
     }
+  }
+  if (contextMode !== "stateful" && contextMode !== "stateless") {
+    throw new Error("Runtime configuration has an invalid context mode");
+  }
+  if (!Number.isInteger(browserTurnRetries)
+    || browserTurnRetries < 0
+    || browserTurnRetries > 10) {
+    throw new Error("Runtime configuration has invalid browser turn retries");
+  }
+  if (!Number.isInteger(browserRetryBackoffMs)
+    || browserRetryBackoffMs < 250
+    || browserRetryBackoffMs > 60_000) {
+    throw new Error("Runtime configuration has invalid browser retry backoff");
   }
   if (config.proAvailable && !config.solAvailable) {
     throw new Error("Runtime configuration cannot enable Pro without Sol");
